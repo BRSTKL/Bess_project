@@ -96,6 +96,97 @@ def generate_synthetic_entsoe_data(start_date, end_date):
     }, index=idx)
     return df
 
+def generate_synthetic_inference_data_in_app(today, tomorrow):
+    start_date = today - datetime.timedelta(days=10)
+    tomorrow_dt = datetime.datetime.combine(tomorrow, datetime.time.min)
+    idx = pd.date_range(start_date, tomorrow_dt + datetime.timedelta(hours=23), freq="h", tz="Europe/Berlin")
+    rng = np.random.default_rng(42)
+    hours = idx.hour.to_numpy()
+    
+    # Prices (synthetic)
+    shape = np.array([
+        45, 40, 38, 36, 35, 40, 55, 75,
+        70, 55, 35, 15, -5, -10, 5, 30,
+        55, 80, 110, 120, 95, 75, 60, 50
+    ])
+    base_price = shape[hours].astype(float)
+    price = base_price + rng.normal(0, 12, len(idx))
+    
+    # Null out tomorrow's prices to simulate real-world prediction
+    tomorrow_mask = idx.date >= tomorrow
+    price[tomorrow_mask] = np.nan
+    
+    # Load forecast
+    load_shape = np.array([
+        40000, 38000, 37000, 37000, 39000, 42000, 50000, 60000,
+        65000, 64000, 62000, 60000, 58000, 58000, 59000, 60000,
+        62000, 66000, 70000, 72000, 68000, 62000, 52000, 45000
+    ])
+    load = load_shape[hours].astype(float) + rng.normal(0, 2500, len(idx))
+    
+    # Solar/Wind forecasts
+    solar_base = np.zeros(24)
+    solar_base[7:18] = np.array([500, 1500, 3000, 5000, 6500, 7000, 6500, 5000, 3000, 1500, 500])
+    solar = solar_base[hours].astype(float) + rng.uniform(0, 400, len(idx))
+    solar[solar < 0] = 0
+    
+    wind_onshore = rng.uniform(5000, 25000, len(idx)) + np.sin(np.arange(len(idx)) / 24.0) * 5000
+    wind_offshore = rng.uniform(1000, 8000, len(idx)) + np.cos(np.arange(len(idx)) / 48.0) * 2000
+    
+    df = pd.DataFrame({
+        "price_eur_mwh": price,
+        "load_fc_mw": load,
+        "Solar": solar,
+        "Wind Onshore": wind_onshore,
+        "Wind Offshore": wind_offshore
+    }, index=idx)
+    return df
+
+def predict_tomorrow_prices_in_app(df, today, tomorrow):
+    feat = forecast.make_features(df)
+    train_data = feat.dropna(subset=["target"])
+    test_data = feat[feat.index.date == tomorrow]
+    
+    if len(test_data) == 0:
+        test_data = feat.tail(24)
+        
+    feat_cols = [c for c in feat.columns if c != "target"]
+    
+    pred_lgb = np.zeros(len(test_data))
+    if forecast.HAS_LGB:
+        import lightgbm as lgb
+        model_lgb = lgb.LGBMRegressor(
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1
+        )
+        model_lgb.fit(train_data[feat_cols], train_data["target"])
+        pred_lgb = model_lgb.predict(test_data[feat_cols])
+        
+    pred_xgb = np.zeros(len(test_data))
+    if forecast.HAS_XGB:
+        import xgboost as xgb
+        model_xgb = xgb.XGBRegressor(
+            n_estimators=400, learning_rate=0.03, max_depth=6,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0
+        )
+        model_xgb.fit(train_data[feat_cols], train_data["target"])
+        pred_xgb = model_xgb.predict(test_data[feat_cols])
+        
+    if forecast.HAS_LGB and forecast.HAS_XGB:
+        pred_prices = 0.5 * pred_lgb + 0.5 * pred_xgb
+        model_name = "Ensemble (LightGBM + XGBoost)"
+    elif forecast.HAS_LGB:
+        pred_prices = pred_lgb
+        model_name = "LightGBM"
+    elif forecast.HAS_XGB:
+        pred_prices = pred_xgb
+        model_name = "XGBoost"
+    else:
+        pred_prices = test_data["price_lag24"].to_numpy()
+        model_name = "Lag-24h (Fallback)"
+        
+    return pd.Series(pred_prices, index=test_data.index, name="predicted_price"), model_name
+
 # Main Title & Description
 st.title("🔋 BESS Arbitrage & Price Forecasting Dashboard")
 st.write("Optimize Battery Energy Storage System (BESS) charging and evaluate LightGBM price forecasting models.")
@@ -230,10 +321,125 @@ else:
 
 if df is not None:
     # Set up layout tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Daily Optimization Plan", "📈 Multi-Day Backtest & Forecasting", "📁 Raw Data Viewer"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔮 Tomorrow's Live Plan", "📊 Daily Optimization Plan", "📈 Multi-Day Backtest & Forecasting", "📁 Raw Data Viewer"])
     
-    # --- TAB 1: DAILY OPTIMIZATION ---
+    # --- TAB 1: TOMORROW'S LIVE PLAN ---
     with tab1:
+        st.header("🔮 Tomorrow's Live Operation Plan (Live Optimizer)")
+        st.write(
+            "Bu modül, yarının fiyat eğrisini tahmin etmek için canlı hava tahmini, yük tahmini ve tarihsel fiyat "
+            "verilerini ENTSO-E'den indirir. Ardından LightGBM & XGBoost Ensemble modelini eğitip yarının fiyatlarını tahmin eder "
+            "ve bataryanın yarın için en karlı şarj/deşarj takvimini çıkartır."
+        )
+        
+        # We can trigger tomorrow's optimization explicitly
+        run_tomorrow = st.button("🔮 Run Tomorrow's Forecast & Optimization", use_container_width=True)
+        
+        if run_tomorrow or "tomorrow_results" in st.session_state:
+            if run_tomorrow:
+                with st.spinner("Fetching live data and running ML models for tomorrow..."):
+                    today = datetime.date.today()
+                    tomorrow = today + datetime.timedelta(days=1)
+                    
+                    # Set API key in environment if provided
+                    if api_key:
+                        os.environ["ENTSOE_API_KEY"] = api_key
+                        
+                    is_live = False
+                    # Try to fetch live data
+                    if api_key and len(api_key) > 10:
+                        try:
+                            import predict_tomorrow
+                            df_tomorrow = predict_tomorrow.get_live_inference_data(today, tomorrow)
+                            is_live = True
+                            st.success("Successfully fetched live ENTSO-E data for tomorrow's forecast!")
+                        except Exception as e:
+                            st.warning(f"Failed to fetch live ENTSO-E data ({e}). Falling back to offline synthetic data.")
+                            df_tomorrow = generate_synthetic_inference_data_in_app(today, tomorrow)
+                    else:
+                        st.info("ENTSO-E API Key not provided or invalid. Running in offline/synthetic mode.")
+                        df_tomorrow = generate_synthetic_inference_data_in_app(today, tomorrow)
+                        
+                    # Predict tomorrow's prices
+                    pred_series, model_name = predict_tomorrow_prices_in_app(df_tomorrow, today, tomorrow)
+                    pred_prices = pred_series.to_numpy()
+                    
+                    # Run battery optimization
+                    res_tomorrow = bess_arbitrage.optimize_day(pred_prices, bat)
+                    
+                    st.session_state.tomorrow_results = {
+                        "pred_series": pred_series,
+                        "model_name": model_name,
+                        "res": res_tomorrow,
+                        "is_live": is_live,
+                        "tomorrow_date": tomorrow
+                    }
+            
+            # Display results
+            t_res = st.session_state.tomorrow_results
+            pred_series = t_res["pred_series"]
+            model_name = t_res["model_name"]
+            res = t_res["res"]
+            tomorrow_date = t_res["tomorrow_date"]
+            
+            if res["status"] in ("optimal", "optimal_inaccurate"):
+                daily_profit = res["profit"]
+                total_charge_mwh = float(np.sum(res["charge"]))
+                total_discharge_mwh = float(np.sum(res["discharge"]))
+                
+                # Metrics cards
+                st.subheader(f"Metrics Summary for Tomorrow ({tomorrow_date})")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Expected Profit", f"€ {daily_profit:,.2f}")
+                m2.metric("Total Charge", f"{total_charge_mwh:.2f} MWh")
+                m3.metric("Total Discharge", f"{total_discharge_mwh:.2f} MWh")
+                m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
+                
+                # Plot data
+                plot_df = pd.DataFrame({
+                    "Predicted Price (€/MWh)": pred_series.values,
+                    "SOC (MWh)": res["soc"][1:],
+                    "Charge Power (MW)": res["charge"],
+                    "Discharge Power (MW)": res["discharge"]
+                }, index=pred_series.index)
+                
+                plot_df["Action"] = "Idle"
+                plot_df.loc[plot_df["Charge Power (MW)"] > 1e-3, "Action"] = "CHARGE 🔌"
+                plot_df.loc[plot_df["Discharge Power (MW)"] > 1e-3, "Action"] = "DISCHARGE ⚡"
+                
+                # Charts
+                st.subheader("Price Forecast & SOC Profile")
+                st.line_chart(plot_df[["Predicted Price (€/MWh)", "SOC (MWh)"]])
+                
+                st.subheader("BESS Operation Schedule")
+                st.bar_chart(plot_df[["Charge Power (MW)", "Discharge Power (MW)"]])
+                
+                # Table
+                st.subheader("Hourly Operation Guide")
+                hourly_table = pd.DataFrame({
+                    "Predicted Price (€/MWh)": plot_df["Predicted Price (€/MWh)"].round(2),
+                    "Charge Rate (MW)": plot_df["Charge Power (MW)"].round(3),
+                    "Discharge Rate (MW)": plot_df["Discharge Power (MW)"].round(3),
+                    "SOC (MWh)": plot_df["SOC (MWh)"].round(3),
+                    "Action": plot_df["Action"]
+                })
+                hourly_table.index = hourly_table.index.strftime("%H:%M")
+                st.dataframe(hourly_table, use_container_width=True)
+                
+                # Download tomorrow's schedule
+                csv_tomorrow = plot_df.to_csv().encode('utf-8')
+                st.download_button(
+                    label="📥 Download Tomorrow's Schedule CSV",
+                    data=csv_tomorrow,
+                    file_name=f"tomorrow_bess_schedule_{tomorrow_date}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.error(f"Optimization solver failed for tomorrow with status: {res['status']}")
+
+    # --- TAB 2: DAILY OPTIMIZATION ---
+    with tab2:
         st.header("📊 Single Day Optimization (Perfect Foresight)")
         st.write("Select a single day to view the optimized BESS operation schedule.")
         
@@ -303,8 +509,8 @@ if df is not None:
             else:
                 st.error("No valid prices found for the selected date.")
 
-    # --- TAB 2: MULTI-DAY BACKTEST & FORECASTING ---
-    with tab2:
+    # --- TAB 3: MULTI-DAY BACKTEST & FORECASTING ---
+    with tab3:
         st.header("📈 Backtest & Forecast Comparison")
         st.write("Compare the financial returns of different trading strategies:")
         st.markdown("""
@@ -435,8 +641,8 @@ if df is not None:
                     "Daily Average Profit (€)": "€{:,.2f}"
                 }), use_container_width=True)
 
-    # --- TAB 3: RAW DATA VIEWER ---
-    with tab3:
+    # --- TAB 4: RAW DATA VIEWER ---
+    with tab4:
         st.header("📁 Raw Hourly Dataset")
         st.write("Browse and download the underlying dataset containing prices, loads, and generation forecast data.")
         st.dataframe(df.style.format(precision=2), use_container_width=True)
