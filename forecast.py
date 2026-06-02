@@ -16,6 +16,12 @@ try:
 except ImportError:
     HAS_LGB = False
 
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+
 
 def make_features(df):
     X = pd.DataFrame(index=df.index)
@@ -72,12 +78,43 @@ def lgbm_walkforward(feat, train_end):
         raise ValueError("Test set empty - train_end must be before data end.")
     feat_cols = [c for c in data.columns if c != "target"]
     model = lgb.LGBMRegressor(
-        n_estimators=400, learning_rate=0.05, num_leaves=31,
+        n_estimators=400, learning_rate=0.03, num_leaves=31,
         subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
     )
     model.fit(train[feat_cols], train["target"])
     pred = model.predict(test[feat_cols])
     return pd.Series(pred, index=test.index, name="pred_lgbm")
+
+
+def xgboost_walkforward(feat, train_end):
+    if not HAS_XGB:
+        raise RuntimeError("xgboost not installed: pip install xgboost")
+    data = feat.dropna()
+    cut = pd.Timestamp(train_end, tz=data.index.tz)
+    train, test = data[data.index < cut], data[data.index >= cut]
+    if len(test) == 0:
+        raise ValueError("Test set empty - train_end must be before data end.")
+    feat_cols = [c for c in data.columns if c != "target"]
+    model = xgb.XGBRegressor(
+        n_estimators=400, learning_rate=0.03, max_depth=6,
+        subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0,
+    )
+    model.fit(train[feat_cols], train["target"])
+    pred = model.predict(test[feat_cols])
+    return pd.Series(pred, index=test.index, name="pred_xgb")
+
+
+def ensemble_walkforward(feat, train_end):
+    if HAS_LGB and HAS_XGB:
+        pred_lgb = lgbm_walkforward(feat, train_end)
+        pred_xgb = xgboost_walkforward(feat, train_end)
+        return pd.Series(0.5 * pred_lgb + 0.5 * pred_xgb, index=pred_lgb.index, name="pred_ensemble")
+    elif HAS_LGB:
+        return lgbm_walkforward(feat, train_end).rename("pred_ensemble")
+    elif HAS_XGB:
+        return xgboost_walkforward(feat, train_end).rename("pred_ensemble")
+    else:
+        raise RuntimeError("Neither lightgbm nor xgboost is installed.")
 
 
 def backtest_with_forecast(real_price, pred_price, bat, dt_h=1.0):
@@ -120,22 +157,38 @@ def evaluate(df, train_end=None):
     print("%-22s%12.0f%11.0f%%" % ("Baseline (lag168)", bl["total"],
                                     100 * bl["total"] / pf["total"]))
 
-    if HAS_LGB:
-        print("\n  [Training LightGBM - may take 1-2 min on full year...]")
+    if HAS_LGB or HAS_XGB:
         feat = make_features(df)
-        pred = lgbm_walkforward(feat, train_end)
         mask = real.index >= pd.Timestamp(train_end, tz=real.index.tz)
         pf_t = backtest_with_forecast(real[mask], real[mask], bat)
         bl_t = backtest_with_forecast(real[mask], base_pred[mask], bat)
-        ml_t = backtest_with_forecast(real[mask], pred, bat)
+        
+        print("\n  [Training Machine Learning Models...]")
+        
+        preds = {}
+        if HAS_LGB:
+            print("  Training LightGBM...")
+            preds["LightGBM"] = lgbm_walkforward(feat, train_end)
+        if HAS_XGB:
+            print("  Training XGBoost...")
+            preds["XGBoost"] = xgboost_walkforward(feat, train_end)
+        if HAS_LGB and HAS_XGB:
+            print("  Blending Ensemble...")
+            preds["Ensemble (LGBM+XGB)"] = ensemble_walkforward(feat, train_end)
+            
         print("\n  [Test window only - fair comparison]")
-        print("%-22s%12.0f%11.0f%%" % ("Perfect (test)", pf_t["total"], 100.0))
-        print("%-22s%12.0f%11.0f%%" % ("Baseline (test)", bl_t["total"],
+        print("%-25s%12s%12s" % ("Strategy", "Total EUR", "Capture %"))
+        print("-" * 49)
+        print("%-25s%12.0f%11.0f%%" % ("Perfect (test)", pf_t["total"], 100.0))
+        print("%-25s%12.0f%11.0f%%" % ("Baseline (test)", bl_t["total"],
                                         100 * bl_t["total"] / pf_t["total"]))
-        print("%-22s%12.0f%11.0f%%" % ("LightGBM (test)", ml_t["total"],
-                                        100 * ml_t["total"] / pf_t["total"]))
+                                        
+        for name, pred in preds.items():
+            ml_t = backtest_with_forecast(real[mask], pred, bat)
+            print("%-25s%12.0f%11.0f%%" % (name + " (test)", ml_t["total"],
+                                            100 * ml_t["total"] / pf_t["total"]))
     else:
-        print("\n  (LightGBM skipped - pip install lightgbm to enable)")
+        print("\n  (ML skipped - pip install lightgbm or xgboost to enable)")
 
 
 if __name__ == "__main__":
