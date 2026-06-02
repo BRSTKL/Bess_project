@@ -200,6 +200,15 @@ cycle_cost = st.sidebar.slider("Cycle Cost (€/MWh)", min_value=0.0, max_value=
 soc_init = st.sidebar.slider("Initial State-of-Charge (SOC)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
 
 st.sidebar.markdown("---")
+st.sidebar.header("📉 Battery Degradation settings")
+use_degradation = st.sidebar.toggle("Enable Dynamic Degradation", value=False)
+deg_coef_soc = 0.5
+deg_coef_power = 0.2
+if use_degradation:
+    deg_coef_soc = st.sidebar.slider("High SOC Stress Coeff (€/MWh)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
+    deg_coef_power = st.sidebar.slider("Power C-Rate Stress Coeff (€/MW²h)", min_value=0.0, max_value=2.0, value=0.2, step=0.05)
+
+st.sidebar.markdown("---")
 st.sidebar.header("📅 Data Configuration")
 data_source = st.sidebar.selectbox("Data Source", ["Synthetic Data (Offline)", "ENTSO-E API (Live)"])
 
@@ -229,7 +238,9 @@ bat = bess_arbitrage.Battery(
     power_mw=pow_rate,
     rte=rte,
     soc_init_frac=soc_init,
-    cycle_cost_eur_mwh=cycle_cost
+    cycle_cost_eur_mwh=cycle_cost,
+    degradation_coef_soc=deg_coef_soc,
+    degradation_coef_power=deg_coef_power
 )
 
 # Load data helper
@@ -365,7 +376,7 @@ if df is not None:
                     pred_prices = pred_series.to_numpy()
                     
                     # Run battery optimization
-                    res_tomorrow = bess_arbitrage.optimize_day(pred_prices, bat)
+                    res_tomorrow = bess_arbitrage.optimize_day(pred_prices, bat, use_degradation=use_degradation)
                     
                     st.session_state.tomorrow_results = {
                         "pred_series": pred_series,
@@ -389,11 +400,21 @@ if df is not None:
                 
                 # Metrics cards
                 st.subheader(f"Metrics Summary for Tomorrow ({tomorrow_date})")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Expected Profit", f"€ {daily_profit:,.2f}")
-                m2.metric("Total Charge", f"{total_charge_mwh:.2f} MWh")
-                m3.metric("Total Discharge", f"{total_discharge_mwh:.2f} MWh")
-                m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
+                if use_degradation:
+                    gross_profit = res["gross_profit"] - res["cycle_cost"]
+                    deg_cost = res["degradation_cost"]
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Gross Profit", f"€ {gross_profit:,.2f}", help="Arbitrage profit before degradation penalty")
+                    m2.metric("Est. Degradation Cost", f"€ {deg_cost:,.2f}", help="Convex SOC and Power C-rate penalty")
+                    m3.metric("Net Profit", f"€ {daily_profit:,.2f}", help="Arbitrage profit minus degradation penalty")
+                    m4.metric("Total Discharged", f"{total_discharge_mwh:.2f} MWh")
+                    m5.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
+                else:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Expected Profit", f"€ {daily_profit:,.2f}")
+                    m2.metric("Total Charge", f"{total_charge_mwh:.2f} MWh")
+                    m3.metric("Total Discharge", f"{total_discharge_mwh:.2f} MWh")
+                    m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
                 
                 # Plot data
                 plot_df = pd.DataFrame({
@@ -457,7 +478,7 @@ if df is not None:
             prices = day_df["price_eur_mwh"].dropna().to_numpy()
             
             if len(prices) > 0:
-                res = bess_arbitrage.optimize_day(prices, bat)
+                res = bess_arbitrage.optimize_day(prices, bat, use_degradation=use_degradation)
                 
                 if res["status"] in ("optimal", "optimal_inaccurate"):
                     # Calculate metrics
@@ -466,11 +487,21 @@ if df is not None:
                     total_discharge_mwh = float(np.sum(res["discharge"]))
                     
                     # Columns for metrics
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Daily Profit", f"€ {daily_profit:,.2f}")
-                    m2.metric("Total Charged", f"{total_charge_mwh:.2f} MWh")
-                    m3.metric("Total Discharged", f"{total_discharge_mwh:.2f} MWh")
-                    m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
+                    if use_degradation:
+                        gross_profit = res["gross_profit"] - res["cycle_cost"]
+                        deg_cost = res["degradation_cost"]
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("Gross Profit", f"€ {gross_profit:,.2f}", help="Arbitrage profit before degradation penalty")
+                        m2.metric("Est. Degradation Cost", f"€ {deg_cost:,.2f}", help="Convex SOC and Power C-rate penalty")
+                        m3.metric("Net Profit", f"€ {daily_profit:,.2f}", help="Arbitrage profit minus degradation penalty")
+                        m4.metric("Total Discharged", f"{total_discharge_mwh:.2f} MWh")
+                        m5.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
+                    else:
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Daily Profit", f"€ {daily_profit:,.2f}")
+                        m2.metric("Total Charged", f"{total_charge_mwh:.2f} MWh")
+                        m3.metric("Total Discharged", f"{total_discharge_mwh:.2f} MWh")
+                        m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
                     
                     # Create plotting data
                     plot_df = pd.DataFrame({
@@ -555,9 +586,9 @@ if df is not None:
                         
                         # Compare on the test window only (fair comparison)
                         mask = real.index >= eval_dt
-                        pf_test = forecast.backtest_with_forecast(real[mask], real[mask], bat)
-                        bl_test = forecast.backtest_with_forecast(real[mask], base_pred[mask], bat)
-                        ml_test = forecast.backtest_with_forecast(real[mask], pred_lgb, bat)
+                        pf_test = forecast.backtest_with_forecast(real[mask], real[mask], bat, use_degradation=use_degradation)
+                        bl_test = forecast.backtest_with_forecast(real[mask], base_pred[mask], bat, use_degradation=use_degradation)
+                        ml_test = forecast.backtest_with_forecast(real[mask], pred_lgb, bat, use_degradation=use_degradation)
                         
                         # Create cumulative profit curves
                         # We will build day-by-day profits
@@ -577,20 +608,34 @@ if df is not None:
                             mp = pred_lgb.loc[day_idx].to_numpy() if day_idx[0] in pred_lgb.index else np.array([])
                             
                             # Perfect
-                            p_res = bess_arbitrage.optimize_day(rp, bat) if len(rp) == 24 else {"status": "failed"}
+                            p_res = bess_arbitrage.optimize_day(rp, bat, use_degradation=use_degradation) if len(rp) == 24 else {"status": "failed"}
                             if p_res["status"] in ("optimal", "optimal_inaccurate"):
                                 pf_cum += p_res["profit"]
                                 
                             # Baseline
-                            b_res = bess_arbitrage.optimize_day(bp, bat) if len(bp) == 24 and not np.isnan(bp).any() else {"status": "failed"}
+                            b_res = bess_arbitrage.optimize_day(bp, bat, use_degradation=use_degradation) if len(bp) == 24 and not np.isnan(bp).any() else {"status": "failed"}
                             if b_res["status"] in ("optimal", "optimal_inaccurate"):
-                                bl_cum += (rp @ b_res["discharge"] - rp @ b_res["charge"] - bat.cycle_cost * b_res["discharge"].sum())
+                                if use_degradation:
+                                    soc_threshold = 0.8 * bat.E
+                                    soc_penalty_val = bat.degradation_coef_soc * np.sum(np.maximum(0, b_res["soc"][1:] - soc_threshold))
+                                    power_penalty_val = bat.degradation_coef_power * (np.sum(b_res["charge"]**2) + np.sum(b_res["discharge"]**2))
+                                    deg_cost = soc_penalty_val + power_penalty_val
+                                else:
+                                    deg_cost = 0.0
+                                bl_cum += (rp @ b_res["discharge"] - rp @ b_res["charge"] - bat.cycle_cost * b_res["discharge"].sum() - deg_cost)
                                 
                             # ML (LightGBM)
                             if len(mp) == 24 and not np.isnan(mp).any():
-                                m_res = bess_arbitrage.optimize_day(mp, bat)
+                                m_res = bess_arbitrage.optimize_day(mp, bat, use_degradation=use_degradation)
                                 if m_res["status"] in ("optimal", "optimal_inaccurate"):
-                                    ml_cum += (rp @ m_res["discharge"] - rp @ m_res["charge"] - bat.cycle_cost * m_res["discharge"].sum())
+                                    if use_degradation:
+                                        soc_threshold = 0.8 * bat.E
+                                        soc_penalty_val = bat.degradation_coef_soc * np.sum(np.maximum(0, m_res["soc"][1:] - soc_threshold))
+                                        power_penalty_val = bat.degradation_coef_power * (np.sum(m_res["charge"]**2) + np.sum(m_res["discharge"]**2))
+                                        deg_cost = soc_penalty_val + power_penalty_val
+                                    else:
+                                        deg_cost = 0.0
+                                    ml_cum += (rp @ m_res["discharge"] - rp @ m_res["charge"] - bat.cycle_cost * m_res["discharge"].sum() - deg_cost)
                                     
                             cum_data.append({
                                 "Date": day,

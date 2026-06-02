@@ -117,7 +117,7 @@ def ensemble_walkforward(feat, train_end):
         raise RuntimeError("Neither lightgbm nor xgboost is installed.")
 
 
-def backtest_with_forecast(real_price, pred_price, bat, dt_h=1.0):
+def backtest_with_forecast(real_price, pred_price, bat, dt_h=1.0, use_degradation=False):
     common = real_price.index.intersection(pred_price.index)
     real_price, pred_price = real_price[common], pred_price[common]
     daily_profit = []
@@ -126,11 +126,20 @@ def backtest_with_forecast(real_price, pred_price, bat, dt_h=1.0):
         pp = pred_price.loc[idx].to_numpy()
         if len(rp) < 2 or np.isnan(pp).any():
             continue
-        plan = optimize_day(pp, bat, dt_h)
+        plan = optimize_day(pp, bat, dt_h, use_degradation=use_degradation)
         if plan["status"] not in ("optimal", "optimal_inaccurate"):
             continue
+            
+        if use_degradation:
+            soc_threshold = 0.8 * bat.E
+            soc_penalty_val = bat.degradation_coef_soc * np.sum(np.maximum(0, plan["soc"][1:] - soc_threshold))
+            power_penalty_val = bat.degradation_coef_power * (np.sum(plan["charge"]**2) + np.sum(plan["discharge"]**2))
+            deg_cost = soc_penalty_val + power_penalty_val
+        else:
+            deg_cost = 0.0
+
         real_profit = (rp @ plan["discharge"] - rp @ plan["charge"]
-                       - bat.cycle_cost * plan["discharge"].sum())
+                       - bat.cycle_cost * plan["discharge"].sum() - deg_cost)
         daily_profit.append(real_profit)
     arr = np.array(daily_profit)
     return {"total": float(arr.sum()),

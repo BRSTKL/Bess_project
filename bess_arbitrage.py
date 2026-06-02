@@ -20,6 +20,8 @@ class Battery:
         soc_min_frac=0.0,
         soc_max_frac=1.0,
         cycle_cost_eur_mwh=4.0,
+        degradation_coef_soc=0.5,
+        degradation_coef_power=0.2,
     ):
         self.E = capacity_mwh
         self.P = power_mw
@@ -29,9 +31,11 @@ class Battery:
         self.soc_min = soc_min_frac * capacity_mwh
         self.soc_max = soc_max_frac * capacity_mwh
         self.cycle_cost = cycle_cost_eur_mwh
+        self.degradation_coef_soc = degradation_coef_soc
+        self.degradation_coef_power = degradation_coef_power
 
 
-def optimize_day(prices, bat, dt_h=1.0, soc_start=None, soc_end=None):
+def optimize_day(prices, bat, dt_h=1.0, soc_start=None, soc_end=None, use_degradation=False):
     T = len(prices)
     if soc_start is None:
         soc_start = bat.soc_init
@@ -48,17 +52,63 @@ def optimize_day(prices, bat, dt_h=1.0, soc_start=None, soc_end=None):
         cons += [soc[t + 1] >= bat.soc_min, soc[t + 1] <= bat.soc_max]
         cons += [c[t] <= bat.P * dt_h, d[t] <= bat.P * dt_h]
 
-    revenue = prices @ d - prices @ c - bat.cycle_cost * cp.sum(d)
+    # Calculate gross arbitrage revenue and baseline cycle cost
+    gross_revenue = prices @ d - prices @ c
+    cycle_degradation = bat.cycle_cost * cp.sum(d)
+    
+    degradation_cost = 0.0
+    soc_penalty_val = 0.0
+    power_penalty_val = 0.0
+    
+    if use_degradation:
+        # 1. High SOC stress: Penalty for staying above 80% SOC
+        soc_threshold = 0.8 * bat.E
+        soc_penalty = cp.sum(cp.pos(soc[1:] - soc_threshold))
+        
+        # 2. C-rate / Power stress: Penalty for rapid/high power charge/discharge
+        power_penalty = cp.sum_squares(c) + cp.sum_squares(d)
+        
+        degradation_cost = bat.degradation_coef_soc * soc_penalty + bat.degradation_coef_power * power_penalty
+        
+    revenue = gross_revenue - cycle_degradation - degradation_cost
     prob = cp.Problem(cp.Maximize(revenue), cons)
-    prob.solve(solver=cp.HIGHS)
+    
+    try:
+        # Default solver selection by CVXPY (handles QP automatically)
+        prob.solve()
+    except Exception:
+        # Fallback to ECOS solver if default solver has issues
+        prob.solve(solver=cp.ECOS)
+
+    # Evaluate individual cost terms post-solve
+    if prob.status in ("optimal", "optimal_inaccurate"):
+        gross_val = float(gross_revenue.value)
+        cycle_val = float(cycle_degradation.value)
+        if use_degradation:
+            soc_threshold = 0.8 * bat.E
+            soc_penalty_val = float((bat.degradation_coef_soc * cp.sum(cp.pos(soc[1:] - soc_threshold))).value)
+            power_penalty_val = float((bat.degradation_coef_power * (cp.sum_squares(c) + cp.sum_squares(d))).value)
+            deg_cost_val = soc_penalty_val + power_penalty_val
+        else:
+            deg_cost_val = 0.0
+    else:
+        gross_val = 0.0
+        cycle_val = 0.0
+        deg_cost_val = 0.0
 
     return {
         "status": prob.status,
-        "profit": float(prob.value),
+        "profit": float(prob.value) if prob.status in ("optimal", "optimal_inaccurate") else 0.0,
+        "gross_profit": gross_val,
+        "cycle_cost": cycle_val,
+        "degradation_cost": deg_cost_val,
+        "soc_penalty": soc_penalty_val,
+        "power_penalty": power_penalty_val,
         "charge": c.value,
         "discharge": d.value,
         "soc": soc.value,
     }
+
 
 
 def synthetic_prices(n_days=30, seed=42):
