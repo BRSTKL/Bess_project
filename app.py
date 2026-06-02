@@ -121,9 +121,12 @@ if start_date >= end_date:
 # Set up ENTSO-E parameters
 api_key = ""
 if data_source == "ENTSO-E API (Live)":
-    api_key_env = os.environ.get("ENTSOE_API_KEY", "")
-    api_key = st.sidebar.text_input("ENTSO-E API Key", value=api_key_env, type="password")
-    if not api_key:
+    api_key_env = os.environ.get("ENTSOE_API_KEY", "").strip()
+    api_key = st.sidebar.text_input("ENTSO-E API Key", value=api_key_env, type="password").strip()
+    if api_key:
+        masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else api_key
+        st.sidebar.caption(f"🔑 Key Loaded: `{masked_key}` ({len(api_key)} chars)")
+    else:
         st.sidebar.warning("API Key is required to fetch real data.")
 
 # Run Optimization button
@@ -147,7 +150,7 @@ def get_data(source, start_str, end_str, api_key_val):
         if not api_key_val:
             raise ValueError("ENTSO-E API key is missing. Enter it in the sidebar.")
         # Temporarily set environment variable
-        os.environ["ENTSOE_API_KEY"] = api_key_val
+        os.environ["ENTSOE_API_KEY"] = api_key_val.strip()
         # Do not catch and print errors here; let the caller handle it gracefully
         return entsoe_pipeline.build_dataset(start_str, end_str)
 
