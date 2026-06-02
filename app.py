@@ -148,17 +148,15 @@ def get_data(source, start_str, end_str, api_key_val):
             raise ValueError("ENTSO-E API key is missing. Enter it in the sidebar.")
         # Temporarily set environment variable
         os.environ["ENTSOE_API_KEY"] = api_key_val
-        try:
-            df = entsoe_pipeline.build_dataset(start_str, end_str)
-            return df
-        except Exception as e:
-            st.error(f"Error fetching data from ENTSO-E API: {e}")
-            raise e
+        # Do not catch and print errors here; let the caller handle it gracefully
+        return entsoe_pipeline.build_dataset(start_str, end_str)
 
 # Core execution
 if "df" not in st.session_state:
     # Initialize with default synthetic data on load
     st.session_state.df = generate_synthetic_entsoe_data("2025-01-01", "2025-02-01")
+if "data_status" not in st.session_state:
+    st.session_state.data_status = "synthetic"
 
 if run_btn:
     with st.spinner("Loading data and running simulation..."):
@@ -166,11 +164,37 @@ if run_btn:
             start_str = start_date.strftime("%Y-%m-%d")
             end_str = end_date.strftime("%Y-%m-%d")
             st.session_state.df = get_data(data_source, start_str, end_str, api_key)
+            st.session_state.data_status = "live" if data_source == "ENTSO-E API (Live)" else "synthetic"
             st.success("Data loaded and simulation completed!")
         except Exception as e:
-            st.error(f"Failed to run analysis: {e}")
+            err_msg = str(e)
+            if "401" in err_msg or "Unauthorized" in err_msg:
+                st.sidebar.error("❌ ENTSO-E API Key Unauthorized (401)")
+                st.error("🔑 **ENTSO-E API Anahtarı Yetkisiz (401 Error)**: Girilen API anahtarı geçersiz veya henüz aktifleştirilmemiş.\n\n"
+                         "**Nasıl Düzeltilir?**\n"
+                         "1. [ENTSO-E Transparency Portal](https://transparency.entsoe.eu/) adresine kayıt olun.\n"
+                         "2. Kayıtlı e-posta adresinizden **transparency@entsoe.eu** adresine 'API access' konulu bir e-posta gönderin.\n"
+                         "3. Hesabınız aktifleştirildikten sonra (genellikle birkaç saat sürer) token'ınız çalışacaktır.\n\n"
+                         "**Geçici Çözüm (Fallback):** Analizin kesintiye uğramaması için seçtiğiniz tarih aralığına uygun **Sentetik (Yapay) Veri** otomatik olarak üretilmiştir. Arayüzü incelemeye devam edebilirsiniz.")
+            else:
+                st.sidebar.error(f"❌ ENTSO-E Bağlantı Hatası: {e}")
+                st.error(f"⚠️ **ENTSO-E Veri Çekme Hatası**: {e}\n\n"
+                         "**Geçici Çözüm (Fallback):** Sentetik veri otomatik olarak yüklenmiştir.")
+            
+            # Fallback action
+            st.session_state.df = generate_synthetic_entsoe_data(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+            st.session_state.data_status = "fallback"
 
 df = st.session_state.df
+
+# Show active data status banner
+if st.session_state.data_status == "live":
+    st.info("🟢 **Aktif Veri:** Canlı ENTSO-E API Verisi")
+elif st.session_state.data_status == "fallback":
+    st.warning("⚠️ **Aktif Veri:** Sentetik Veri (ENTSO-E API bağlantısı yetkisiz veya başarısız olduğu için otomatik geçiş yapıldı).")
+else:
+    st.info("ℹ️ **Aktif Veri:** Çevrimdışı Sentetik Veri")
+
 
 if df is not None:
     # Set up layout tabs
