@@ -157,25 +157,73 @@ def run_prediction_and_schedule(gamma=0.0):
         model_xgb.fit(train_data[feat_cols], train_data["target"])
         pred_xgb = model_xgb.predict(test_data[feat_cols])
         print("  XGBoost model trained.")
+
+    # 3. Train CatBoost
+    pred_cat = np.zeros(len(test_data))
+    if forecast.HAS_CAT:
+        import catboost as cb
+        model_cat = cb.CatBoostRegressor(
+            iterations=400, learning_rate=0.03, depth=6,
+            random_seed=42, verbose=0
+        )
+        model_cat.fit(train_data[feat_cols], train_data["target"])
+        pred_cat = model_cat.predict(test_data[feat_cols])
+        print("  CatBoost model trained.")
+
+    # 4. Train MLP Neural Network
+    pred_mlp = np.zeros(len(test_data))
+    if forecast.HAS_MLP:
+        import warnings
+        from sklearn.exceptions import ConvergenceWarning
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
         
-    # 3. Create Blended Ensemble
-    if forecast.HAS_LGB and forecast.HAS_XGB:
-        pred_prices = 0.5 * pred_lgb + 0.5 * pred_xgb
-        model_name = "Ensemble (LightGBM + XGBoost)"
-    elif forecast.HAS_LGB:
-        pred_prices = pred_lgb
-        model_name = "LightGBM"
-    elif forecast.HAS_XGB:
-        pred_prices = pred_xgb
-        model_name = "XGBoost"
+        from sklearn.neural_network import MLPRegressor
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        train_data_mlp = train_data.dropna()
+        
+        if len(train_data_mlp) >= 24:
+            X_train_scaled = scaler.fit_transform(train_data_mlp[feat_cols])
+            X_test_scaled = scaler.transform(test_data[feat_cols].fillna(0.0))
+            
+            model_mlp = MLPRegressor(
+                hidden_layer_sizes=(100, 50), activation='relu', solver='adam',
+                max_iter=500, random_state=42
+            )
+            model_mlp.fit(X_train_scaled, train_data_mlp["target"])
+            pred_mlp = model_mlp.predict(X_test_scaled)
+            print("  MLP Neural Network model trained.")
+        else:
+            print("  [WARN] MLP skipped: not enough non-NaN training data.")
+        
+    # 5. Create Blended Ensemble
+    preds = []
+    model_tags = []
+    if forecast.HAS_LGB:
+        preds.append(pred_lgb)
+        model_tags.append("LightGBM")
+    if forecast.HAS_XGB:
+        preds.append(pred_xgb)
+        model_tags.append("XGBoost")
+    if forecast.HAS_CAT:
+        preds.append(pred_cat)
+        model_tags.append("CatBoost")
+    if forecast.HAS_MLP:
+        preds.append(pred_mlp)
+        model_tags.append("MLP")
+        
+    if preds:
+        pred_prices = sum(preds) / len(preds)
+        model_name = f"Ensemble ({' + '.join(model_tags)})"
     else:
-        # Simple lag fallback
         pred_prices = test_data["price_lag24"].to_numpy()
         model_name = "Lag-24h (ML Fallback)"
         
-    # Quantile prediction using LGBM spreads anchored on the ensemble
+    # Quantile prediction using spreads anchored on the ensemble
     pred_p10 = None
     pred_p90 = None
+    deltas = []
+    
     if forecast.HAS_LGB:
         print("  Training LightGBM Quantile models (P10 & P90)...")
         import lightgbm as lgb
@@ -194,15 +242,33 @@ def run_prediction_and_schedule(gamma=0.0):
         )
         model_lgb_p90.fit(train_data[feat_cols], train_data["target"])
         p90_lgb = model_lgb_p90.predict(test_data[feat_cols])
+        deltas.append((p10_lgb - pred_lgb, p90_lgb - pred_lgb))
         
-        if forecast.HAS_XGB:
-            delta_p10 = p10_lgb - pred_lgb
-            delta_p90 = p90_lgb - pred_lgb
-            pred_p10 = pred_prices + delta_p10
-            pred_p90 = pred_prices + delta_p90
-        else:
-            pred_p10 = p10_lgb
-            pred_p90 = p90_lgb
+    if forecast.HAS_CAT:
+        print("  Training CatBoost Quantile models (P10 & P90)...")
+        import catboost as cb
+        model_cat_p10 = cb.CatBoostRegressor(
+            loss_function='Quantile:alpha=0.1',
+            iterations=400, learning_rate=0.03, depth=6,
+            random_seed=42, verbose=0
+        )
+        model_cat_p10.fit(train_data[feat_cols], train_data["target"])
+        p10_cat = model_cat_p10.predict(test_data[feat_cols])
+        
+        model_cat_p90 = cb.CatBoostRegressor(
+            loss_function='Quantile:alpha=0.9',
+            iterations=400, learning_rate=0.03, depth=6,
+            random_seed=42, verbose=0
+        )
+        model_cat_p90.fit(train_data[feat_cols], train_data["target"])
+        p90_cat = model_cat_p90.predict(test_data[feat_cols])
+        deltas.append((p10_cat - pred_cat, p90_cat - pred_cat))
+        
+    if deltas:
+        delta_p10 = sum(d[0] for d in deltas) / len(deltas)
+        delta_p90 = sum(d[1] for d in deltas) / len(deltas)
+        pred_p10 = pred_prices + delta_p10
+        pred_p90 = pred_prices + delta_p90
     else:
         std_dev = train_data["target"].std() if len(train_data) > 0 else 15.0
         pred_p10 = pred_prices - 1.28 * std_dev

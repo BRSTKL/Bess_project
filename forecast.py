@@ -22,6 +22,18 @@ try:
 except ImportError:
     HAS_XGB = False
 
+try:
+    import catboost as cb
+    HAS_CAT = True
+except ImportError:
+    HAS_CAT = False
+
+try:
+    from sklearn.neural_network import MLPRegressor
+    HAS_MLP = True
+except ImportError:
+    HAS_MLP = False
+
 
 def make_features(df):
     X = pd.DataFrame(index=df.index)
@@ -113,25 +125,102 @@ def xgboost_walkforward(feat, train_end):
     return pd.Series(pred, index=test.index, name="pred_xgb")
 
 
+def catboost_walkforward(feat, train_end, quantile=None):
+    if not HAS_CAT:
+        raise RuntimeError("catboost not installed: pip install catboost")
+    data = feat.dropna()
+    cut = pd.Timestamp(train_end, tz=data.index.tz)
+    train, test = data[data.index < cut], data[data.index >= cut]
+    if len(test) == 0:
+        raise ValueError("Test set empty - train_end must be before data end.")
+    feat_cols = [c for c in data.columns if c != "target"]
+    
+    if quantile is not None:
+        model = cb.CatBoostRegressor(
+            loss_function=f'Quantile:alpha={quantile}',
+            iterations=400, learning_rate=0.03, depth=6,
+            random_seed=42, verbose=0
+        )
+    else:
+        model = cb.CatBoostRegressor(
+            iterations=400, learning_rate=0.03, depth=6,
+            random_seed=42, verbose=0
+        )
+    model.fit(train[feat_cols], train["target"])
+    pred = model.predict(test[feat_cols])
+    name = f"pred_cat_q{int(quantile*100)}" if quantile is not None else "pred_cat"
+    return pd.Series(pred, index=test.index, name=name)
+
+
+def mlp_walkforward(feat, train_end):
+    if not HAS_MLP:
+        raise RuntimeError("scikit-learn not installed.")
+    data = feat.dropna()
+    cut = pd.Timestamp(train_end, tz=data.index.tz)
+    train, test = data[data.index < cut], data[data.index >= cut]
+    if len(test) == 0:
+        raise ValueError("Test set empty - train_end must be before data end.")
+    feat_cols = [c for c in data.columns if c != "target"]
+    
+    import warnings
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(train[feat_cols])
+    X_test = scaler.transform(test[feat_cols])
+    
+    model = MLPRegressor(
+        hidden_layer_sizes=(100, 50), activation='relu', solver='adam',
+        max_iter=500, random_state=42
+    )
+    model.fit(X_train, train["target"])
+    pred = model.predict(X_test)
+    return pd.Series(pred, index=test.index, name="pred_mlp")
+
+
 def ensemble_walkforward(feat, train_end, quantile=None):
     if quantile is None:
-        if HAS_LGB and HAS_XGB:
-            pred_lgb = lgbm_walkforward(feat, train_end)
-            pred_xgb = xgboost_walkforward(feat, train_end)
-            return pd.Series(0.5 * pred_lgb + 0.5 * pred_xgb, index=pred_lgb.index, name="pred_ensemble")
-        elif HAS_LGB:
-            return lgbm_walkforward(feat, train_end).rename("pred_ensemble")
-        elif HAS_XGB:
-            return xgboost_walkforward(feat, train_end).rename("pred_ensemble")
-        else:
-            raise RuntimeError("Neither lightgbm nor xgboost is installed.")
+        preds = []
+        if HAS_LGB:
+            preds.append(lgbm_walkforward(feat, train_end))
+        if HAS_XGB:
+            preds.append(xgboost_walkforward(feat, train_end))
+        if HAS_CAT:
+            preds.append(catboost_walkforward(feat, train_end))
+        if HAS_MLP:
+            preds.append(mlp_walkforward(feat, train_end))
+            
+        if not preds:
+            raise RuntimeError("No forecasting models are installed/available.")
+            
+        base_series = preds[0]
+        if len(preds) > 1:
+            combined = sum(p.values for p in preds) / len(preds)
+            return pd.Series(combined, index=base_series.index, name="pred_ensemble")
+        return base_series.rename("pred_ensemble")
     else:
-        # Quantile prediction using LGBM as anchor spread applied on ensemble median
+        # Quantile prediction anchoring spreads on ensemble median
         pred_base = ensemble_walkforward(feat, train_end, quantile=None)
-        pred_lgb_mean = lgbm_walkforward(feat, train_end, quantile=None)
-        pred_lgb_q = lgbm_walkforward(feat, train_end, quantile=quantile)
         
-        delta = pred_lgb_q - pred_lgb_mean
+        deltas = []
+        if HAS_LGB:
+            pred_lgb_mean = lgbm_walkforward(feat, train_end, quantile=None)
+            pred_lgb_q = lgbm_walkforward(feat, train_end, quantile=quantile)
+            deltas.append(pred_lgb_q - pred_lgb_mean)
+        if HAS_CAT:
+            pred_cat_mean = catboost_walkforward(feat, train_end, quantile=None)
+            pred_cat_q = catboost_walkforward(feat, train_end, quantile=quantile)
+            deltas.append(pred_cat_q - pred_cat_mean)
+            
+        if deltas:
+            delta = sum(d.values for d in deltas) / len(deltas)
+        else:
+            std_val = feat.dropna()["target"].std()
+            sign = 1.0 if quantile > 0.5 else -1.0
+            delta = sign * 1.28 * std_val
+            
         pred_q = pred_base + delta
         name = f"pred_ensemble_q{int(quantile*100)}"
         return pd.Series(pred_q, index=pred_base.index, name=name)
@@ -211,7 +300,7 @@ def evaluate(df, train_end=None):
     print("%-22s%12.0f%11.0f%%" % ("Baseline (lag168)", bl["total"],
                                     100 * bl["total"] / pf["total"]))
 
-    if HAS_LGB or HAS_XGB:
+    if HAS_LGB or HAS_XGB or HAS_CAT or HAS_MLP:
         feat = make_features(df)
         mask = real.index >= pd.Timestamp(train_end, tz=real.index.tz)
         pf_t = backtest_with_forecast(real[mask], real[mask], bat)
@@ -226,23 +315,36 @@ def evaluate(df, train_end=None):
         if HAS_XGB:
             print("  Training XGBoost...")
             preds["XGBoost"] = xgboost_walkforward(feat, train_end)
-        if HAS_LGB and HAS_XGB:
-            print("  Blending Ensemble...")
-            preds["Ensemble (LGBM+XGB)"] = ensemble_walkforward(feat, train_end)
+        if HAS_CAT:
+            print("  Training CatBoost...")
+            preds["CatBoost"] = catboost_walkforward(feat, train_end)
+        if HAS_MLP:
+            print("  Training MLP Neural Network...")
+            preds["MLP Neural Network"] = mlp_walkforward(feat, train_end)
+            
+        model_tags = []
+        if HAS_LGB: model_tags.append("LGB")
+        if HAS_XGB: model_tags.append("XGB")
+        if HAS_CAT: model_tags.append("CAT")
+        if HAS_MLP: model_tags.append("MLP")
+        
+        ensemble_label = f"Ensemble ({'+'.join(model_tags)})"
+        print(f"  Blending {ensemble_label}...")
+        preds[ensemble_label] = ensemble_walkforward(feat, train_end)
             
         print("\n  [Test window only - fair comparison]")
-        print("%-25s%12s%12s" % ("Strategy", "Total EUR", "Capture %"))
-        print("-" * 49)
-        print("%-25s%12.0f%11.0f%%" % ("Perfect (test)", pf_t["total"], 100.0))
-        print("%-25s%12.0f%11.0f%%" % ("Baseline (test)", bl_t["total"],
+        print("%-28s%12s%12s" % ("Strategy", "Total EUR", "Capture %"))
+        print("-" * 52)
+        print("%-28s%12.0f%11.0f%%" % ("Perfect (test)", pf_t["total"], 100.0))
+        print("%-28s%12.0f%11.0f%%" % ("Baseline (test)", bl_t["total"],
                                         100 * bl_t["total"] / pf_t["total"]))
                                         
         for name, pred in preds.items():
             ml_t = backtest_with_forecast(real[mask], pred, bat)
-            print("%-25s%12.0f%11.0f%%" % (name + " (test)", ml_t["total"],
+            print("%-28s%12.0f%11.0f%%" % (name + " (test)", ml_t["total"],
                                             100 * ml_t["total"] / pf_t["total"]))
     else:
-        print("\n  (ML skipped - pip install lightgbm or xgboost to enable)")
+        print("\n  (ML skipped - no machine learning packages installed)")
 
 
 if __name__ == "__main__":

@@ -8,3 +8,4 @@ entsoe_cache/
 .venv/
 env/
 venv/
+catboost_info/
