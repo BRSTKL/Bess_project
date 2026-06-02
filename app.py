@@ -171,17 +171,22 @@ if run_btn:
             st.success("Data loaded and simulation completed!")
         except Exception as e:
             err_msg = str(e)
+            import re
+            # Mask the API key in the error message for privacy
+            safe_err_msg = re.sub(r'securityToken=[a-zA-Z0-9\-]+', 'securityToken=********', err_msg)
+            
             if "401" in err_msg or "Unauthorized" in err_msg:
                 st.sidebar.error("❌ ENTSO-E API Key Unauthorized (401)")
-                st.error("🔑 **ENTSO-E API Anahtarı Yetkisiz (401 Error)**: Girilen API anahtarı geçersiz veya henüz aktifleştirilmemiş.\n\n"
+                st.error(f"🔑 **ENTSO-E API Anahtarı Yetkisiz (401 Error)**: Girilen API anahtarı geçersiz veya henüz aktifleştirilmemiş.\n\n"
+                         f"**Sistem Hatası:** `{safe_err_msg}`\n\n"
                          "**Nasıl Düzeltilir?**\n"
                          "1. [ENTSO-E Transparency Portal](https://transparency.entsoe.eu/) adresine kayıt olun.\n"
                          "2. Kayıtlı e-posta adresinizden **transparency@entsoe.eu** adresine 'API access' konulu bir e-posta gönderin.\n"
                          "3. Hesabınız aktifleştirildikten sonra (genellikle birkaç saat sürer) token'ınız çalışacaktır.\n\n"
                          "**Geçici Çözüm (Fallback):** Analizin kesintiye uğramaması için seçtiğiniz tarih aralığına uygun **Sentetik (Yapay) Veri** otomatik olarak üretilmiştir. Arayüzü incelemeye devam edebilirsiniz.")
             else:
-                st.sidebar.error(f"❌ ENTSO-E Bağlantı Hatası: {e}")
-                st.error(f"⚠️ **ENTSO-E Veri Çekme Hatası**: {e}\n\n"
+                st.sidebar.error(f"❌ ENTSO-E Bağlantı Hatası")
+                st.error(f"⚠️ **ENTSO-E Veri Çekme Hatası**:\n\n`{safe_err_msg}`\n\n"
                          "**Geçici Çözüm (Fallback):** Sentetik veri otomatik olarak yüklenmiştir.")
             
             # Fallback action
