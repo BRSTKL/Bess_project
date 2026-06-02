@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+cvxpy
+plotly
+scikit-learn
+lightgbm
+xgboost
+catboost
+entsoe-py
+holidays
