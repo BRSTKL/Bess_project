@@ -2,6 +2,8 @@
 import cvxpy as cp
 import sys
 sys.path.insert(0, ".")
+# Fix Windows console UTF-8 printing issues
+sys.stdout.reconfigure(encoding='utf-8')
 
 import os
 import pathlib
@@ -38,8 +40,9 @@ def get_live_inference_data(today, tomorrow):
 def get_synthetic_inference_data(today, tomorrow):
     print("  [Offline] Generating synthetic data for inference...")
     start_date = today - datetime.timedelta(days=10)
-    # Generate synthetic ENTSO-E data
-    idx = pd.date_range(start_date, tomorrow + datetime.timedelta(hours=23), freq="h", tz="Europe/Berlin")
+    # Convert tomorrow (date) to datetime to allow adding hourly timedelta
+    tomorrow_dt = datetime.datetime.combine(tomorrow, datetime.time.min)
+    idx = pd.date_range(start_date, tomorrow_dt + datetime.timedelta(hours=23), freq="h", tz="Europe/Berlin")
     rng = np.random.default_rng(42)
     hours = idx.hour.to_numpy()
     
