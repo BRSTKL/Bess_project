@@ -209,6 +209,15 @@ if use_degradation:
     deg_coef_power = st.sidebar.slider("Power C-Rate Stress Coeff (€/MW²h)", min_value=0.0, max_value=2.0, value=0.2, step=0.05)
 
 st.sidebar.markdown("---")
+st.sidebar.header("🌐 Multi-Market Settings")
+use_multi_market = st.sidebar.toggle("Enable Multi-Market Co-Optimization", value=False)
+fcr_price_val = 18.0
+idm_spread_val = 10.0
+if use_multi_market:
+    fcr_price_val = st.sidebar.slider("FCR Capacity Price (€/MW/h)", min_value=5.0, max_value=50.0, value=18.0, step=1.0)
+    idm_spread_val = st.sidebar.slider("Intraday Price Volatility Spread (€/MWh)", min_value=0.0, max_value=30.0, value=10.0, step=1.0)
+
+st.sidebar.markdown("---")
 st.sidebar.header("📅 Data Configuration")
 data_source = st.sidebar.selectbox("Data Source", ["Synthetic Data (Offline)", "ENTSO-E API (Live)"])
 
@@ -375,8 +384,19 @@ if df is not None:
                     pred_series, model_name = predict_tomorrow_prices_in_app(df_tomorrow, today, tomorrow)
                     pred_prices = pred_series.to_numpy()
                     
+                    # Simulating IDM and FCR prices for tomorrow
+                    T = len(pred_prices)
+                    tomorrow_idm = pred_prices + idm_spread_val * np.sin(np.arange(T) * 2 * np.pi / 24)
+                    tomorrow_fcr = np.full(T, fcr_price_val)
+                    
                     # Run battery optimization
-                    res_tomorrow = bess_arbitrage.optimize_day(pred_prices, bat, use_degradation=use_degradation)
+                    res_tomorrow = bess_arbitrage.optimize_day(
+                        pred_prices, bat, 
+                        use_degradation=use_degradation,
+                        use_multi_market=use_multi_market,
+                        idm_prices=tomorrow_idm,
+                        fcr_prices=tomorrow_fcr
+                    )
                     
                     st.session_state.tomorrow_results = {
                         "pred_series": pred_series,
@@ -400,7 +420,23 @@ if df is not None:
                 
                 # Metrics cards
                 st.subheader(f"Metrics Summary for Tomorrow ({tomorrow_date})")
-                if use_degradation:
+                if use_multi_market:
+                    dam_prof = res["dam_profit"]
+                    idm_prof = res["idm_profit"]
+                    fcr_prof = res["fcr_profit"]
+                    net_prof = res["profit"]
+                    deg_cost = res.get("degradation_cost", 0.0)
+                    
+                    col1, col2, col3, col4, col5 = st.columns(5)
+                    col1.metric("DAM Profit", f"€ {dam_prof:,.2f}", help="Day-Ahead market net arbitrage profit")
+                    col2.metric("IDM Profit", f"€ {idm_prof:,.2f}", help="Intraday market net arbitrage profit")
+                    col3.metric("FCR Revenue", f"€ {fcr_prof:,.2f}", help="FCR Reserve Capacity payments")
+                    if use_degradation:
+                        col4.metric("Est. Degradation Cost", f"€ {deg_cost:,.2f}")
+                    else:
+                        col4.metric("Cycle Wear Cost", f"€ {res['cycle_cost']:,.2f}")
+                    col5.metric("Net Profit", f"€ {net_prof:,.2f}", help="Total Revenue minus wear and degradation cost")
+                elif use_degradation:
                     gross_profit = res["gross_profit"] - res["cycle_cost"]
                     deg_cost = res["degradation_cost"]
                     m1, m2, m3, m4, m5 = st.columns(5)
@@ -417,33 +453,55 @@ if df is not None:
                     m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
                 
                 # Plot data
-                plot_df = pd.DataFrame({
+                plot_df_data = {
                     "Predicted Price (€/MWh)": pred_series.values,
                     "SOC (MWh)": res["soc"][1:],
-                    "Charge Power (MW)": res["charge"],
-                    "Discharge Power (MW)": res["discharge"]
-                }, index=pred_series.index)
+                    "Total Charge Power (MW)": res["charge"],
+                    "Total Discharge Power (MW)": res["discharge"]
+                }
+                if use_multi_market:
+                    plot_df_data["DAM Charge (MW)"] = res["c_dam"]
+                    plot_df_data["DAM Discharge (MW)"] = res["d_dam"]
+                    plot_df_data["IDM Charge (MW)"] = res["c_idm"]
+                    plot_df_data["IDM Discharge (MW)"] = res["d_idm"]
+                    plot_df_data["FCR Capacity (MW)"] = res["r_fcr"]
+                    
+                plot_df = pd.DataFrame(plot_df_data, index=pred_series.index)
                 
                 plot_df["Action"] = "Idle"
-                plot_df.loc[plot_df["Charge Power (MW)"] > 1e-3, "Action"] = "CHARGE 🔌"
-                plot_df.loc[plot_df["Discharge Power (MW)"] > 1e-3, "Action"] = "DISCHARGE ⚡"
+                plot_df.loc[plot_df["Total Charge Power (MW)"] > 1e-3, "Action"] = "CHARGE 🔌"
+                plot_df.loc[plot_df["Total Discharge Power (MW)"] > 1e-3, "Action"] = "DISCHARGE ⚡"
                 
                 # Charts
                 st.subheader("Price Forecast & SOC Profile")
                 st.line_chart(plot_df[["Predicted Price (€/MWh)", "SOC (MWh)"]])
                 
-                st.subheader("BESS Operation Schedule")
-                st.bar_chart(plot_df[["Charge Power (MW)", "Discharge Power (MW)"]])
+                if use_multi_market:
+                    st.subheader("BESS Multi-Market Scheduling Schedule")
+                    st.bar_chart(plot_df[["DAM Charge (MW)", "DAM Discharge (MW)", "IDM Charge (MW)", "IDM Discharge (MW)", "FCR Capacity (MW)"]])
+                else:
+                    st.subheader("BESS Operation Schedule")
+                    st.bar_chart(plot_df[["Total Charge Power (MW)", "Total Discharge Power (MW)"]])
                 
                 # Table
                 st.subheader("Hourly Operation Guide")
-                hourly_table = pd.DataFrame({
+                hourly_table_data = {
                     "Predicted Price (€/MWh)": plot_df["Predicted Price (€/MWh)"].round(2),
-                    "Charge Rate (MW)": plot_df["Charge Power (MW)"].round(3),
-                    "Discharge Rate (MW)": plot_df["Discharge Power (MW)"].round(3),
-                    "SOC (MWh)": plot_df["SOC (MWh)"].round(3),
-                    "Action": plot_df["Action"]
-                })
+                    "SOC (MWh)": plot_df["SOC (MWh)"].round(3)
+                }
+                if use_multi_market:
+                    hourly_table_data["DAM Charge (MW)"] = plot_df["DAM Charge (MW)"].round(3)
+                    hourly_table_data["DAM Discharge (MW)"] = plot_df["DAM Discharge (MW)"].round(3)
+                    hourly_table_data["IDM Charge (MW)"] = plot_df["IDM Charge (MW)"].round(3)
+                    hourly_table_data["IDM Discharge (MW)"] = plot_df["IDM Discharge (MW)"].round(3)
+                    hourly_table_data["FCR Capacity (MW)"] = plot_df["FCR Capacity (MW)"].round(3)
+                    hourly_table_data["Action"] = plot_df["Action"]
+                else:
+                    hourly_table_data["Charge Rate (MW)"] = plot_df["Total Charge Power (MW)"].round(3)
+                    hourly_table_data["Discharge Rate (MW)"] = plot_df["Total Discharge Power (MW)"].round(3)
+                    hourly_table_data["Action"] = plot_df["Action"]
+                    
+                hourly_table = pd.DataFrame(hourly_table_data)
                 hourly_table.index = hourly_table.index.strftime("%H:%M")
                 st.dataframe(hourly_table, use_container_width=True)
                 
@@ -478,7 +536,17 @@ if df is not None:
             prices = day_df["price_eur_mwh"].dropna().to_numpy()
             
             if len(prices) > 0:
-                res = bess_arbitrage.optimize_day(prices, bat, use_degradation=use_degradation)
+                T = len(prices)
+                day_idm = prices + idm_spread_val * np.sin(np.arange(T) * 2 * np.pi / 24)
+                day_fcr = np.full(T, fcr_price_val)
+                
+                res = bess_arbitrage.optimize_day(
+                    prices, bat, 
+                    use_degradation=use_degradation,
+                    use_multi_market=use_multi_market,
+                    idm_prices=day_idm,
+                    fcr_prices=day_fcr
+                )
                 
                 if res["status"] in ("optimal", "optimal_inaccurate"):
                     # Calculate metrics
@@ -487,7 +555,23 @@ if df is not None:
                     total_discharge_mwh = float(np.sum(res["discharge"]))
                     
                     # Columns for metrics
-                    if use_degradation:
+                    if use_multi_market:
+                        dam_prof = res["dam_profit"]
+                        idm_prof = res["idm_profit"]
+                        fcr_prof = res["fcr_profit"]
+                        net_prof = res["profit"]
+                        deg_cost = res.get("degradation_cost", 0.0)
+                        
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        col1.metric("DAM Profit", f"€ {dam_prof:,.2f}", help="Day-Ahead market net arbitrage profit")
+                        col2.metric("IDM Profit", f"€ {idm_prof:,.2f}", help="Intraday market net arbitrage profit")
+                        col3.metric("FCR Revenue", f"€ {fcr_prof:,.2f}", help="FCR Reserve Capacity payments")
+                        if use_degradation:
+                            col4.metric("Est. Degradation Cost", f"€ {deg_cost:,.2f}")
+                        else:
+                            col4.metric("Cycle Wear Cost", f"€ {res['cycle_cost']:,.2f}")
+                        col5.metric("Net Profit", f"€ {net_prof:,.2f}", help="Total Revenue minus wear and degradation cost")
+                    elif use_degradation:
                         gross_profit = res["gross_profit"] - res["cycle_cost"]
                         deg_cost = res["degradation_cost"]
                         m1, m2, m3, m4, m5 = st.columns(5)
@@ -504,16 +588,24 @@ if df is not None:
                         m4.metric("Cycle Equivalent", f"{(total_discharge_mwh / bat.E):.2f} Cycles")
                     
                     # Create plotting data
-                    plot_df = pd.DataFrame({
+                    plot_df_data = {
                         "Price (€/MWh)": prices,
                         "SOC (MWh)": res["soc"][1:],  # exclude initial soc at index 0
-                        "Charge Power (MW)": res["charge"],
-                        "Discharge Power (MW)": res["discharge"]
-                    }, index=day_df.index[:len(prices)])
+                        "Total Charge Power (MW)": res["charge"],
+                        "Total Discharge Power (MW)": res["discharge"]
+                    }
+                    if use_multi_market:
+                        plot_df_data["DAM Charge (MW)"] = res["c_dam"]
+                        plot_df_data["DAM Discharge (MW)"] = res["d_dam"]
+                        plot_df_data["IDM Charge (MW)"] = res["c_idm"]
+                        plot_df_data["IDM Discharge (MW)"] = res["d_idm"]
+                        plot_df_data["FCR Capacity (MW)"] = res["r_fcr"]
+                        
+                    plot_df = pd.DataFrame(plot_df_data, index=day_df.index[:len(prices)])
                     
                     plot_df["Action"] = "Idle"
-                    plot_df.loc[plot_df["Charge Power (MW)"] > 1e-3, "Action"] = "Charge"
-                    plot_df.loc[plot_df["Discharge Power (MW)"] > 1e-3, "Action"] = "Discharge"
+                    plot_df.loc[plot_df["Total Charge Power (MW)"] > 1e-3, "Action"] = "Charge"
+                    plot_df.loc[plot_df["Total Discharge Power (MW)"] > 1e-3, "Action"] = "Discharge"
                     
                     # Custom Streamlit Charts
                     st.subheader("Price vs Battery Action")
@@ -522,17 +614,30 @@ if df is not None:
                     st.line_chart(plot_df[["Price (€/MWh)", "SOC (MWh)"]])
                     
                     # Draw Charge/Discharge Schedule
-                    st.bar_chart(plot_df[["Charge Power (MW)", "Discharge Power (MW)"]])
+                    if use_multi_market:
+                        st.bar_chart(plot_df[["DAM Charge (MW)", "DAM Discharge (MW)", "IDM Charge (MW)", "IDM Discharge (MW)", "FCR Capacity (MW)"]])
+                    else:
+                        st.bar_chart(plot_df[["Total Charge Power (MW)", "Total Discharge Power (MW)"]])
                     
                     # Display hourly breakdown
                     st.subheader("Hourly Operations Table")
-                    hourly_table = pd.DataFrame({
+                    hourly_table_data = {
                         "Price (€/MWh)": plot_df["Price (€/MWh)"].round(2),
-                        "Charge Rate (MW)": plot_df["Charge Power (MW)"].round(3),
-                        "Discharge Rate (MW)": plot_df["Discharge Power (MW)"].round(3),
-                        "SOC (MWh)": plot_df["SOC (MWh)"].round(3),
-                        "Action": plot_df["Action"]
-                    })
+                        "SOC (MWh)": plot_df["SOC (MWh)"].round(3)
+                    }
+                    if use_multi_market:
+                        hourly_table_data["DAM Charge (MW)"] = plot_df["DAM Charge (MW)"].round(3)
+                        hourly_table_data["DAM Discharge (MW)"] = plot_df["DAM Discharge (MW)"].round(3)
+                        hourly_table_data["IDM Charge (MW)"] = plot_df["IDM Charge (MW)"].round(3)
+                        hourly_table_data["IDM Discharge (MW)"] = plot_df["IDM Discharge (MW)"].round(3)
+                        hourly_table_data["FCR Capacity (MW)"] = plot_df["FCR Capacity (MW)"].round(3)
+                        hourly_table_data["Action"] = plot_df["Action"]
+                    else:
+                        hourly_table_data["Charge Rate (MW)"] = plot_df["Total Charge Power (MW)"].round(3)
+                        hourly_table_data["Discharge Rate (MW)"] = plot_df["Total Discharge Power (MW)"].round(3)
+                        hourly_table_data["Action"] = plot_df["Action"]
+                        
+                    hourly_table = pd.DataFrame(hourly_table_data)
                     hourly_table.index = hourly_table.index.strftime("%H:%M")
                     st.dataframe(hourly_table, use_container_width=True)
                 else:
@@ -574,11 +679,23 @@ if df is not None:
                         real = df["price_eur_mwh"].dropna()
                         
                         # Perfect foresight
-                        pf = forecast.backtest_with_forecast(real, real, bat)
+                        pf = forecast.backtest_with_forecast(
+                            real, real, bat, 
+                            use_degradation=use_degradation,
+                            use_multi_market=use_multi_market,
+                            fcr_price=fcr_price_val,
+                            idm_spread=idm_spread_val
+                        )
                         
                         # Baseline
                         base_pred = forecast.baseline_forecast(df)
-                        bl = forecast.backtest_with_forecast(real, base_pred, bat)
+                        bl = forecast.backtest_with_forecast(
+                            real, base_pred, bat, 
+                            use_degradation=use_degradation,
+                            use_multi_market=use_multi_market,
+                            fcr_price=fcr_price_val,
+                            idm_spread=idm_spread_val
+                        )
                         
                         # LightGBM Walk-forward
                         feat = forecast.make_features(df)
@@ -586,9 +703,27 @@ if df is not None:
                         
                         # Compare on the test window only (fair comparison)
                         mask = real.index >= eval_dt
-                        pf_test = forecast.backtest_with_forecast(real[mask], real[mask], bat, use_degradation=use_degradation)
-                        bl_test = forecast.backtest_with_forecast(real[mask], base_pred[mask], bat, use_degradation=use_degradation)
-                        ml_test = forecast.backtest_with_forecast(real[mask], pred_lgb, bat, use_degradation=use_degradation)
+                        pf_test = forecast.backtest_with_forecast(
+                            real[mask], real[mask], bat, 
+                            use_degradation=use_degradation,
+                            use_multi_market=use_multi_market,
+                            fcr_price=fcr_price_val,
+                            idm_spread=idm_spread_val
+                        )
+                        bl_test = forecast.backtest_with_forecast(
+                            real[mask], base_pred[mask], bat, 
+                            use_degradation=use_degradation,
+                            use_multi_market=use_multi_market,
+                            fcr_price=fcr_price_val,
+                            idm_spread=idm_spread_val
+                        )
+                        ml_test = forecast.backtest_with_forecast(
+                            real[mask], pred_lgb, bat, 
+                            use_degradation=use_degradation,
+                            use_multi_market=use_multi_market,
+                            fcr_price=fcr_price_val,
+                            idm_spread=idm_spread_val
+                        )
                         
                         # Create cumulative profit curves
                         # We will build day-by-day profits
@@ -608,34 +743,84 @@ if df is not None:
                             mp = pred_lgb.loc[day_idx].to_numpy() if day_idx[0] in pred_lgb.index else np.array([])
                             
                             # Perfect
-                            p_res = bess_arbitrage.optimize_day(rp, bat, use_degradation=use_degradation) if len(rp) == 24 else {"status": "failed"}
+                            T_day = len(rp)
+                            rp_idm = rp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24)
+                            rp_fcr = np.full(T_day, fcr_price_val)
+                            bp_idm = bp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24) if len(bp) == 24 else None
+                            
+                            p_res = bess_arbitrage.optimize_day(
+                                rp, bat, 
+                                use_degradation=use_degradation,
+                                use_multi_market=use_multi_market,
+                                idm_prices=rp_idm,
+                                fcr_prices=rp_fcr
+                            ) if len(rp) == 24 else {"status": "failed"}
                             if p_res["status"] in ("optimal", "optimal_inaccurate"):
                                 pf_cum += p_res["profit"]
                                 
                             # Baseline
-                            b_res = bess_arbitrage.optimize_day(bp, bat, use_degradation=use_degradation) if len(bp) == 24 and not np.isnan(bp).any() else {"status": "failed"}
+                            b_res = bess_arbitrage.optimize_day(
+                                bp, bat, 
+                                use_degradation=use_degradation,
+                                use_multi_market=use_multi_market,
+                                idm_prices=bp_idm,
+                                fcr_prices=rp_fcr
+                            ) if len(bp) == 24 and not np.isnan(bp).any() else {"status": "failed"}
                             if b_res["status"] in ("optimal", "optimal_inaccurate"):
+                                if use_multi_market:
+                                    real_dam = rp @ b_res["d_dam"] - rp @ b_res["c_dam"]
+                                    real_idm = rp_idm @ b_res["d_idm"] - rp_idm @ b_res["c_idm"]
+                                    real_fcr = rp_fcr @ b_res["r_fcr"]
+                                    gross_val = real_dam + real_idm + real_fcr
+                                    cycle_wear = bat.cycle_cost * np.sum(b_res["d_dam"] + b_res["d_idm"])
+                                else:
+                                    gross_val = rp @ b_res["discharge"] - rp @ b_res["charge"]
+                                    cycle_wear = bat.cycle_cost * b_res["discharge"].sum()
+                                    
                                 if use_degradation:
                                     soc_threshold = 0.8 * bat.E
                                     soc_penalty_val = bat.degradation_coef_soc * np.sum(np.maximum(0, b_res["soc"][1:] - soc_threshold))
-                                    power_penalty_val = bat.degradation_coef_power * (np.sum(b_res["charge"]**2) + np.sum(b_res["discharge"]**2))
+                                    if use_multi_market:
+                                        power_penalty_val = bat.degradation_coef_power * (np.sum((b_res["c_dam"]+b_res["c_idm"])**2) + np.sum((b_res["d_dam"]+b_res["d_idm"])**2))
+                                    else:
+                                        power_penalty_val = bat.degradation_coef_power * (np.sum(b_res["charge"]**2) + np.sum(b_res["discharge"]**2))
                                     deg_cost = soc_penalty_val + power_penalty_val
                                 else:
                                     deg_cost = 0.0
-                                bl_cum += (rp @ b_res["discharge"] - rp @ b_res["charge"] - bat.cycle_cost * b_res["discharge"].sum() - deg_cost)
+                                bl_cum += (gross_val - cycle_wear - deg_cost)
                                 
                             # ML (LightGBM)
                             if len(mp) == 24 and not np.isnan(mp).any():
-                                m_res = bess_arbitrage.optimize_day(mp, bat, use_degradation=use_degradation)
+                                mp_idm = mp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24)
+                                m_res = bess_arbitrage.optimize_day(
+                                    mp, bat, 
+                                    use_degradation=use_degradation,
+                                    use_multi_market=use_multi_market,
+                                    idm_prices=mp_idm,
+                                    fcr_prices=rp_fcr
+                                )
                                 if m_res["status"] in ("optimal", "optimal_inaccurate"):
+                                    if use_multi_market:
+                                        real_dam = rp @ m_res["d_dam"] - rp @ m_res["c_dam"]
+                                        real_idm = rp_idm @ m_res["d_idm"] - rp_idm @ m_res["c_idm"]
+                                        real_fcr = rp_fcr @ m_res["r_fcr"]
+                                        gross_val = real_dam + real_idm + real_fcr
+                                        cycle_wear = bat.cycle_cost * np.sum(m_res["d_dam"] + m_res["d_idm"])
+                                    else:
+                                        gross_val = rp @ m_res["discharge"] - rp @ m_res["charge"]
+                                        cycle_wear = bat.cycle_cost * m_res["discharge"].sum()
+                                        
                                     if use_degradation:
                                         soc_threshold = 0.8 * bat.E
                                         soc_penalty_val = bat.degradation_coef_soc * np.sum(np.maximum(0, m_res["soc"][1:] - soc_threshold))
-                                        power_penalty_val = bat.degradation_coef_power * (np.sum(m_res["charge"]**2) + np.sum(m_res["discharge"]**2))
+                                        if use_multi_market:
+                                            power_penalty_val = bat.degradation_coef_power * (np.sum((m_res["c_dam"]+m_res["c_idm"])**2) + np.sum((m_res["d_dam"]+m_res["d_idm"])**2))
+                                        else:
+                                            power_penalty_val = bat.degradation_coef_power * (np.sum(m_res["charge"]**2) + np.sum(m_res["discharge"]**2))
                                         deg_cost = soc_penalty_val + power_penalty_val
                                     else:
                                         deg_cost = 0.0
-                                    ml_cum += (rp @ m_res["discharge"] - rp @ m_res["charge"] - bat.cycle_cost * m_res["discharge"].sum() - deg_cost)
+                                    ml_cum += (gross_val - cycle_wear - deg_cost)
                                     
                             cum_data.append({
                                 "Date": day,

@@ -35,38 +35,76 @@ class Battery:
         self.degradation_coef_power = degradation_coef_power
 
 
-def optimize_day(prices, bat, dt_h=1.0, soc_start=None, soc_end=None, use_degradation=False):
+def optimize_day(
+    prices,
+    bat,
+    dt_h=1.0,
+    soc_start=None,
+    soc_end=None,
+    use_degradation=False,
+    use_multi_market=False,
+    idm_prices=None,
+    fcr_prices=None,
+):
     T = len(prices)
     if soc_start is None:
         soc_start = bat.soc_init
     if soc_end is None:
         soc_end = bat.soc_init
 
-    c = cp.Variable(T, nonneg=True)
-    d = cp.Variable(T, nonneg=True)
+    # Decision variables for Day-Ahead (DAM), Intraday (IDM) and FCR Reserve capacity
+    c_dam = cp.Variable(T, nonneg=True)
+    d_dam = cp.Variable(T, nonneg=True)
+    c_idm = cp.Variable(T, nonneg=True)
+    d_idm = cp.Variable(T, nonneg=True)
+    r_fcr = cp.Variable(T, nonneg=True)
     soc = cp.Variable(T + 1)
+
+    # Use input prices or apply defaults if None
+    if idm_prices is None:
+        idm_prices = prices + 10.0 * np.sin(np.arange(T) * 2 * np.pi / 24)
+    if fcr_prices is None:
+        fcr_prices = np.full(T, 18.0)
 
     cons = [soc[0] == soc_start, soc[T] == soc_end]
     for t in range(T):
-        cons += [soc[t + 1] == soc[t] + bat.eta_c * c[t] - d[t] / bat.eta_d]
+        # SOC dynamics: FCR reserve activation is energy-neutral on average
+        cons += [soc[t + 1] == soc[t] + bat.eta_c * (c_dam[t] + c_idm[t]) - (d_dam[t] + d_idm[t]) / bat.eta_d]
         cons += [soc[t + 1] >= bat.soc_min, soc[t + 1] <= bat.soc_max]
-        cons += [c[t] <= bat.P * dt_h, d[t] <= bat.P * dt_h]
+        
+        # Combined power limits (DAM + IDM + FCR capacity cannot exceed power rating P)
+        cons += [c_dam[t] + c_idm[t] + r_fcr[t] <= bat.P * dt_h]
+        cons += [d_dam[t] + d_idm[t] + r_fcr[t] <= bat.P * dt_h]
+        
+        # FCR SOC buffer constraints: 15 mins (0.25h) full activation must not violate SOC bounds
+        cons += [soc[t] + (0.25 * r_fcr[t]) / bat.eta_d <= bat.soc_max]
+        cons += [soc[t] - 0.25 * bat.eta_c * r_fcr[t] >= bat.soc_min]
 
-    # Calculate gross arbitrage revenue and baseline cycle cost
-    gross_revenue = prices @ d - prices @ c
-    cycle_degradation = bat.cycle_cost * cp.sum(d)
+    if not use_multi_market:
+        # Disable IDM and FCR markets if multi-market optimization is turned off
+        cons += [c_idm == 0, d_idm == 0, r_fcr == 0]
+
+    # Revenue streams
+    dam_revenue = prices @ d_dam - prices @ c_dam
+    idm_revenue = idm_prices @ d_idm - idm_prices @ c_idm
+    fcr_revenue = fcr_prices @ r_fcr
+    
+    gross_revenue = dam_revenue + idm_revenue + fcr_revenue
+    cycle_degradation = bat.cycle_cost * cp.sum(d_dam + d_idm)
     
     degradation_cost = 0.0
     soc_penalty_val = 0.0
     power_penalty_val = 0.0
     
     if use_degradation:
-        # 1. High SOC stress: Penalty for staying above 80% SOC
+        # 1. High SOC stress
         soc_threshold = 0.8 * bat.E
         soc_penalty = cp.sum(cp.pos(soc[1:] - soc_threshold))
         
-        # 2. C-rate / Power stress: Penalty for rapid/high power charge/discharge
-        power_penalty = cp.sum_squares(c) + cp.sum_squares(d)
+        # 2. Power stress
+        total_c = c_dam + c_idm
+        total_d = d_dam + d_idm
+        power_penalty = cp.sum_squares(total_c) + cp.sum_squares(total_d)
         
         degradation_cost = bat.degradation_coef_soc * soc_penalty + bat.degradation_coef_power * power_penalty
         
@@ -74,38 +112,66 @@ def optimize_day(prices, bat, dt_h=1.0, soc_start=None, soc_end=None, use_degrad
     prob = cp.Problem(cp.Maximize(revenue), cons)
     
     try:
-        # Default solver selection by CVXPY (handles QP automatically)
         prob.solve()
     except Exception:
-        # Fallback to ECOS solver if default solver has issues
         prob.solve(solver=cp.ECOS)
 
     # Evaluate individual cost terms post-solve
     if prob.status in ("optimal", "optimal_inaccurate"):
-        gross_val = float(gross_revenue.value)
+        dam_val = float(dam_revenue.value)
+        idm_val = float(idm_revenue.value)
+        fcr_val = float(fcr_revenue.value)
+        gross_val = dam_val + idm_val + fcr_val
         cycle_val = float(cycle_degradation.value)
+        
         if use_degradation:
             soc_threshold = 0.8 * bat.E
             soc_penalty_val = float((bat.degradation_coef_soc * cp.sum(cp.pos(soc[1:] - soc_threshold))).value)
-            power_penalty_val = float((bat.degradation_coef_power * (cp.sum_squares(c) + cp.sum_squares(d))).value)
+            power_penalty_val = float((bat.degradation_coef_power * (cp.sum_squares(c_dam + c_idm) + cp.sum_squares(d_dam + d_idm))).value)
             deg_cost_val = soc_penalty_val + power_penalty_val
         else:
             deg_cost_val = 0.0
+            
+        c_val = c_dam.value + c_idm.value
+        d_val = d_dam.value + d_idm.value
+        c_dam_val = c_dam.value
+        d_dam_val = d_dam.value
+        c_idm_val = c_idm.value
+        d_idm_val = d_idm.value
+        r_fcr_val = r_fcr.value
     else:
+        dam_val = 0.0
+        idm_val = 0.0
+        fcr_val = 0.0
         gross_val = 0.0
         cycle_val = 0.0
         deg_cost_val = 0.0
+        c_val = np.zeros(T)
+        d_val = np.zeros(T)
+        c_dam_val = np.zeros(T)
+        d_dam_val = np.zeros(T)
+        c_idm_val = np.zeros(T)
+        d_idm_val = np.zeros(T)
+        r_fcr_val = np.zeros(T)
 
     return {
         "status": prob.status,
         "profit": float(prob.value) if prob.status in ("optimal", "optimal_inaccurate") else 0.0,
         "gross_profit": gross_val,
+        "dam_profit": dam_val,
+        "idm_profit": idm_val,
+        "fcr_profit": fcr_val,
         "cycle_cost": cycle_val,
         "degradation_cost": deg_cost_val,
         "soc_penalty": soc_penalty_val,
         "power_penalty": power_penalty_val,
-        "charge": c.value,
-        "discharge": d.value,
+        "charge": c_val,
+        "discharge": d_val,
+        "c_dam": c_dam_val,
+        "d_dam": d_dam_val,
+        "c_idm": c_idm_val,
+        "d_idm": d_idm_val,
+        "r_fcr": r_fcr_val,
         "soc": soc.value,
     }
 
