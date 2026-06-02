@@ -142,7 +142,6 @@ bat = bess_arbitrage.Battery(
 )
 
 # Load data helper
-@st.cache_data
 def get_data(source, start_str, end_str, api_key_val):
     if source == "Synthetic Data (Offline)":
         return generate_synthetic_entsoe_data(start_str, end_str)
