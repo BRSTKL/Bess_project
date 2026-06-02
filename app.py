@@ -172,13 +172,38 @@ if run_btn:
         except Exception as e:
             err_msg = str(e)
             import re
+            
             # Mask the API key in the error message for privacy
             safe_err_msg = re.sub(r'securityToken=[a-zA-Z0-9\-]+', 'securityToken=********', err_msg)
+            
+            # Check if there is an XML response body from requests
+            xml_reason = ""
+            try:
+                curr = e
+                while curr:
+                    if hasattr(curr, "response") and curr.response is not None:
+                        resp_text = curr.response.text
+                        if resp_text and ("<Reason>" in resp_text or "<text>" in resp_text):
+                            import xml.etree.ElementTree as ET
+                            # Clean namespace if present to make parsing easier
+                            cleaned_xml = re.sub(r'\sxmlns="[^"]+"', '', resp_text)
+                            root = ET.fromstring(cleaned_xml)
+                            reasons = [elem.text for elem in root.findall(".//text")]
+                            if reasons:
+                                xml_reason = " | ".join(reasons)
+                        break
+                    curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+            except Exception as xml_err:
+                pass
+                
+            error_details = safe_err_msg
+            if xml_reason:
+                error_details += f"\n\n**ENTSO-E Hata Açıklaması (Reason):** `{xml_reason}`"
             
             if "401" in err_msg or "Unauthorized" in err_msg:
                 st.sidebar.error("❌ ENTSO-E API Key Unauthorized (401)")
                 st.error(f"🔑 **ENTSO-E API Anahtarı Yetkisiz (401 Error)**: Girilen API anahtarı geçersiz veya henüz aktifleştirilmemiş.\n\n"
-                         f"**Sistem Hatası:** `{safe_err_msg}`\n\n"
+                         f"**Sistem Hatası:** `{error_details}`\n\n"
                          "**Nasıl Düzeltilir?**\n"
                          "1. [ENTSO-E Transparency Portal](https://transparency.entsoe.eu/) adresine kayıt olun.\n"
                          "2. Kayıtlı e-posta adresinizden **transparency@entsoe.eu** adresine 'API access' konulu bir e-posta gönderin.\n"
@@ -186,7 +211,7 @@ if run_btn:
                          "**Geçici Çözüm (Fallback):** Analizin kesintiye uğramaması için seçtiğiniz tarih aralığına uygun **Sentetik (Yapay) Veri** otomatik olarak üretilmiştir. Arayüzü incelemeye devam edebilirsiniz.")
             else:
                 st.sidebar.error(f"❌ ENTSO-E Bağlantı Hatası")
-                st.error(f"⚠️ **ENTSO-E Veri Çekme Hatası**:\n\n`{safe_err_msg}`\n\n"
+                st.error(f"⚠️ **ENTSO-E Veri Çekme Hatası**:\n\n`{error_details}`\n\n"
                          "**Geçici Çözüm (Fallback):** Sentetik veri otomatik olarak yüklenmiştir.")
             
             # Fallback action
