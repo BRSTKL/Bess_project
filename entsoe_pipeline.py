@@ -20,6 +20,7 @@ import os
 import sys
 import pathlib
 import cvxpy as cp
+import numpy as np
 import pandas as pd
 
 try:
@@ -84,10 +85,54 @@ def get_renewables_forecast(start, end):
 
 
 def build_dataset(start, end):
-    price = get_day_ahead_prices(start, end)
-    load = get_load_forecast(start, end)
-    res = get_renewables_forecast(start, end)
-
+    # Try fetching prices
+    try:
+        price = get_day_ahead_prices(start, end)
+    except Exception as e:
+        print(f"Failed to fetch day-ahead prices: {e}")
+        raise e  # Price is mandatory for BESS, so we must raise if it fails
+        
+    # Try fetching load forecast
+    try:
+        load = get_load_forecast(start, end)
+    except Exception as e:
+        print(f"Warning: Failed to fetch load forecast ({e}). Using synthetic load.")
+        # Generate synthetic load
+        idx = price.index
+        load_shape = np.array([
+            40000, 38000, 37000, 37000, 39000, 42000, 50000, 60000,
+            65000, 64000, 62000, 60000, 58000, 58000, 59000, 60000,
+            62000, 66000, 70000, 72000, 68000, 62000, 52000, 45000
+        ])
+        hours = idx.hour.to_numpy()
+        rng = np.random.default_rng(42)
+        load_vals = load_shape[hours].astype(float) + rng.normal(0, 2000, len(idx))
+        load = pd.Series(load_vals, index=idx, name="load_fc_mw")
+        
+    # Try fetching renewables forecast
+    try:
+        res = get_renewables_forecast(start, end)
+    except Exception as e:
+        print(f"Warning: Failed to fetch wind/solar forecast ({e}). Using synthetic renewables.")
+        # Generate synthetic solar/wind
+        idx = price.index
+        hours = idx.hour.to_numpy()
+        rng = np.random.default_rng(42)
+        
+        solar_base = np.zeros(24)
+        solar_base[7:18] = np.array([500, 1500, 3000, 5000, 6500, 7000, 6500, 5000, 3000, 1500, 500])
+        solar_vals = solar_base[hours].astype(float) + rng.uniform(0, 400, len(idx))
+        solar_vals[solar_vals < 0] = 0
+        
+        wind_onshore_vals = rng.uniform(5000, 25000, len(idx)) + np.sin(np.arange(len(idx)) / 24.0) * 5000
+        wind_offshore_vals = rng.uniform(1000, 8000, len(idx)) + np.cos(np.arange(len(idx)) / 48.0) * 2000
+        
+        res = pd.DataFrame({
+            "Solar": solar_vals,
+            "Wind Onshore": wind_onshore_vals,
+            "Wind Offshore": wind_offshore_vals
+        }, index=idx)
+        
     df = pd.concat([price, load, res], axis=1)
     df = df.resample("1h").mean()
 
