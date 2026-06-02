@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+entsoe_cache/
+.ipynb_checkpoints/
+.env
+.venv/
+env/
+venv/
