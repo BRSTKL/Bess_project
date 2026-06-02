@@ -25,19 +25,35 @@ def make_features(df):
     X["is_weekend"] = (df.index.dayofweek >= 5).astype(int)
     X["hour_sin"] = np.sin(2 * np.pi * X["hour"] / 24)
     X["hour_cos"] = np.cos(2 * np.pi * X["hour"] / 24)
+    
+    # Public Holidays in Germany
+    import holidays
+    de_holidays = holidays.Germany(years=list(df.index.year.unique()))
+    X["is_holiday"] = df.index.map(lambda dt: 1 if dt.date() in de_holidays else 0)
+
     if "load_fc_mw" in df:
         X["load_fc"] = df["load_fc_mw"]
     for col in ["Solar", "Wind Onshore", "Wind Offshore"]:
         if col in df:
             X[col.replace(" ", "_").lower()] = df[col]
+            
     res_cols = [c for c in ["Solar", "Wind Onshore", "Wind Offshore"] if c in df]
     if res_cols and "load_fc_mw" in df:
         X["res_ratio"] = df[res_cols].sum(axis=1) / df["load_fc_mw"]
+        # Net Load (Tüketim - Yenilenebilir Enerji Üretimi)
+        X["net_load"] = df["load_fc_mw"] - df[res_cols].sum(axis=1)
+        
     p = df["price_eur_mwh"]
     X["price_lag24"] = p.shift(24)
     X["price_lag48"] = p.shift(48)
     X["price_lag168"] = p.shift(168)
+    
+    # Rolling Statistics (shifted by 24h to avoid lookahead bias during inference)
     X["price_roll24"] = p.shift(24).rolling(24).mean()
+    X["price_roll24_std"] = p.shift(24).rolling(24).std()
+    X["price_roll168_mean"] = p.shift(24).rolling(168).mean()
+    X["price_roll168_std"] = p.shift(24).rolling(168).std()
+    
     X["target"] = p
     return X
 
