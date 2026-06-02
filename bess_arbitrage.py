@@ -45,6 +45,9 @@ def optimize_day(
     use_multi_market=False,
     idm_prices=None,
     fcr_prices=None,
+    prices_p10=None,
+    prices_p90=None,
+    gamma=0.0,
 ):
     T = len(prices)
     if soc_start is None:
@@ -65,6 +68,11 @@ def optimize_day(
         idm_prices = prices + 10.0 * np.sin(np.arange(T) * 2 * np.pi / 24)
     if fcr_prices is None:
         fcr_prices = np.full(T, 18.0)
+        
+    if prices_p10 is None:
+        prices_p10 = prices - 1.28 * np.std(prices) if len(prices) > 1 else prices - 10.0
+    if prices_p90 is None:
+        prices_p90 = prices + 1.28 * np.std(prices) if len(prices) > 1 else prices + 10.0
 
     cons = [soc[0] == soc_start, soc[T] == soc_end]
     for t in range(T):
@@ -84,12 +92,31 @@ def optimize_day(
         # Disable IDM and FCR markets if multi-market optimization is turned off
         cons += [c_idm == 0, d_idm == 0, r_fcr == 0]
 
-    # Revenue streams
-    dam_revenue = prices @ d_dam - prices @ c_dam
-    idm_revenue = idm_prices @ d_idm - idm_prices @ c_idm
-    fcr_revenue = fcr_prices @ r_fcr
+    # Expected gross revenue across scenarios (P10: 25%, P50: 50%, P90: 25%)
+    dam_rev_p10 = prices_p10 @ d_dam - prices_p10 @ c_dam
+    dam_rev_p50 = prices @ d_dam - prices @ c_dam
+    dam_rev_p90 = prices_p90 @ d_dam - prices_p90 @ c_dam
+    expected_dam = 0.25 * dam_rev_p10 + 0.50 * dam_rev_p50 + 0.25 * dam_rev_p90
     
-    gross_revenue = dam_revenue + idm_revenue + fcr_revenue
+    # IDM Scenario revenues (shifted spread by DAM scenario offsets)
+    idm_p10 = idm_prices - (prices - prices_p10)
+    idm_p90 = idm_prices + (prices_p90 - prices)
+    idm_rev_p10 = idm_p10 @ d_idm - idm_p10 @ c_idm
+    idm_rev_p50 = idm_prices @ d_idm - idm_prices @ c_idm
+    idm_rev_p90 = idm_p90 @ d_idm - idm_p90 @ c_idm
+    expected_idm = 0.25 * idm_rev_p10 + 0.50 * idm_rev_p50 + 0.25 * idm_rev_p90
+    
+    fcr_rev = fcr_prices @ r_fcr
+    
+    expected_gross = expected_dam + expected_idm + fcr_rev
+    
+    # Define cvxpy minimax variable for risk-aversion scenario tracking
+    min_rev = cp.Variable()
+    cons += [min_rev <= dam_rev_p10 + idm_rev_p10 + fcr_rev]
+    cons += [min_rev <= dam_rev_p50 + idm_rev_p50 + fcr_rev]
+    cons += [min_rev <= dam_rev_p90 + idm_rev_p90 + fcr_rev]
+    
+    gross_revenue = (1.0 - gamma) * expected_gross + gamma * min_rev
     cycle_degradation = bat.cycle_cost * cp.sum(d_dam + d_idm)
     
     degradation_cost = 0.0
@@ -118,10 +145,10 @@ def optimize_day(
 
     # Evaluate individual cost terms post-solve
     if prob.status in ("optimal", "optimal_inaccurate"):
-        dam_val = float(dam_revenue.value)
-        idm_val = float(idm_revenue.value)
-        fcr_val = float(fcr_revenue.value)
-        gross_val = dam_val + idm_val + fcr_val
+        gross_val = float(expected_gross.value)
+        dam_val = float(expected_dam.value)
+        idm_val = float(expected_idm.value)
+        fcr_val = float(fcr_rev.value)
         cycle_val = float(cycle_degradation.value)
         
         if use_degradation:

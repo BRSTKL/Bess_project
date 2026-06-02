@@ -185,7 +185,144 @@ def predict_tomorrow_prices_in_app(df, today, tomorrow):
         pred_prices = test_data["price_lag24"].to_numpy()
         model_name = "Lag-24h (Fallback)"
         
-    return pd.Series(pred_prices, index=test_data.index, name="predicted_price"), model_name
+    pred_p10 = None
+    pred_p90 = None
+    if forecast.HAS_LGB:
+        import lightgbm as lgb
+        model_lgb_p10 = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.1,
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1
+        )
+        model_lgb_p10.fit(train_data[feat_cols], train_data["target"])
+        p10_lgb = model_lgb_p10.predict(test_data[feat_cols])
+        
+        model_lgb_p90 = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.9,
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1
+        )
+        model_lgb_p90.fit(train_data[feat_cols], train_data["target"])
+        p90_lgb = model_lgb_p90.predict(test_data[feat_cols])
+        
+        if forecast.HAS_XGB:
+            delta_p10 = p10_lgb - pred_lgb
+            delta_p90 = p90_lgb - pred_lgb
+            pred_p10 = pred_prices + delta_p10
+            pred_p90 = pred_prices + delta_p90
+        else:
+            pred_p10 = p10_lgb
+            pred_p90 = p90_lgb
+    else:
+        std_dev = train_data["target"].std() if len(train_data) > 0 else 15.0
+        pred_p10 = pred_prices - 1.28 * std_dev
+        pred_p90 = pred_prices + 1.28 * std_dev
+        
+    return (
+        pd.Series(pred_prices, index=test_data.index, name="predicted_price"),
+        pd.Series(pred_p10, index=test_data.index, name="predicted_p10"),
+        pd.Series(pred_p90, index=test_data.index, name="predicted_p90"),
+        model_name
+    )
+
+
+def plot_price_and_soc_plotly(df_plot, price_col="Predicted Price (€/MWh)", p10_col=None, p90_col=None, soc_col="SOC (MWh)"):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    
+    # Create figure with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # 1. Add P10-P90 Shaded Band (if available)
+    if p10_col in df_plot.columns and p90_col in df_plot.columns:
+        # P90 line (invisible/transparent, used as top of filled area)
+        fig.add_trace(
+            go.Scatter(
+                x=df_plot.index,
+                y=df_plot[p90_col],
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False,
+                name='P90 Upper Bound'
+            ),
+            secondary_y=False
+        )
+        
+        # P10 line (filled to next y)
+        fig.add_trace(
+            go.Scatter(
+                x=df_plot.index,
+                y=df_plot[p10_col],
+                mode='lines',
+                line=dict(width=0),
+                fill='tonexty',
+                fillcolor='rgba(56, 189, 248, 0.15)', # Sleek semitransparent blue
+                name='90% Confidence Interval (P10-P90)',
+                showlegend=True
+            ),
+            secondary_y=False
+        )
+    
+    # 2. Add Price line
+    fig.add_trace(
+        go.Scatter(
+            x=df_plot.index,
+            y=df_plot[price_col],
+            mode='lines+markers',
+            line=dict(color='#38bdf8', width=3), # Sleek blue
+            name=price_col
+        ),
+        secondary_y=False
+    )
+    
+    # 3. Add SOC line
+    fig.add_trace(
+        go.Scatter(
+            x=df_plot.index,
+            y=df_plot[soc_col],
+            mode='lines',
+            line=dict(color='#10b981', width=2.5, dash='dash'), # Green dashed line
+            name=soc_col
+        ),
+        secondary_y=True
+    )
+    
+    # Update axes and layout
+    fig.update_layout(
+        template="plotly_dark",
+        plot_bgcolor="#0f1116",
+        paper_bgcolor="#0f1116",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="x unified",
+        height=450
+    )
+    
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="#1e293b"
+    )
+    
+    fig.update_yaxes(
+        title_text="Price (€/MWh)",
+        showgrid=True,
+        gridcolor="#1e293b",
+        secondary_y=False
+    )
+    
+    fig.update_yaxes(
+        title_text="SOC (MWh)",
+        showgrid=False,
+        secondary_y=True
+    )
+    
+    return fig
 
 # Main Title & Description
 st.title("🔋 BESS Arbitrage & Price Forecasting Dashboard")
@@ -216,6 +353,10 @@ idm_spread_val = 10.0
 if use_multi_market:
     fcr_price_val = st.sidebar.slider("FCR Capacity Price (€/MW/h)", min_value=5.0, max_value=50.0, value=18.0, step=1.0)
     idm_spread_val = st.sidebar.slider("Intraday Price Volatility Spread (€/MWh)", min_value=0.0, max_value=30.0, value=10.0, step=1.0)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🛡️ Risk Settings")
+gamma = st.sidebar.slider("Risk Aversion Coefficient (gamma)", min_value=0.0, max_value=0.95, value=0.0, step=0.05)
 
 st.sidebar.markdown("---")
 st.sidebar.header("📅 Data Configuration")
@@ -381,8 +522,10 @@ if df is not None:
                         df_tomorrow = generate_synthetic_inference_data_in_app(today, tomorrow)
                         
                     # Predict tomorrow's prices
-                    pred_series, model_name = predict_tomorrow_prices_in_app(df_tomorrow, today, tomorrow)
+                    pred_series, pred_p10_series, pred_p90_series, model_name = predict_tomorrow_prices_in_app(df_tomorrow, today, tomorrow)
                     pred_prices = pred_series.to_numpy()
+                    pred_p10 = pred_p10_series.to_numpy()
+                    pred_p90 = pred_p90_series.to_numpy()
                     
                     # Simulating IDM and FCR prices for tomorrow
                     T = len(pred_prices)
@@ -395,11 +538,16 @@ if df is not None:
                         use_degradation=use_degradation,
                         use_multi_market=use_multi_market,
                         idm_prices=tomorrow_idm,
-                        fcr_prices=tomorrow_fcr
+                        fcr_prices=tomorrow_fcr,
+                        prices_p10=pred_p10,
+                        prices_p90=pred_p90,
+                        gamma=gamma
                     )
                     
                     st.session_state.tomorrow_results = {
                         "pred_series": pred_series,
+                        "pred_p10_series": pred_p10_series,
+                        "pred_p90_series": pred_p90_series,
                         "model_name": model_name,
                         "res": res_tomorrow,
                         "is_live": is_live,
@@ -409,6 +557,8 @@ if df is not None:
             # Display results
             t_res = st.session_state.tomorrow_results
             pred_series = t_res["pred_series"]
+            pred_p10_series = t_res.get("pred_p10_series", None)
+            pred_p90_series = t_res.get("pred_p90_series", None)
             model_name = t_res["model_name"]
             res = t_res["res"]
             tomorrow_date = t_res["tomorrow_date"]
@@ -459,6 +609,11 @@ if df is not None:
                     "Total Charge Power (MW)": res["charge"],
                     "Total Discharge Power (MW)": res["discharge"]
                 }
+                if pred_p10_series is not None:
+                    plot_df_data["predicted_p10"] = pred_p10_series.values
+                if pred_p90_series is not None:
+                    plot_df_data["predicted_p90"] = pred_p90_series.values
+
                 if use_multi_market:
                     plot_df_data["DAM Charge (MW)"] = res["c_dam"]
                     plot_df_data["DAM Discharge (MW)"] = res["d_dam"]
@@ -474,7 +629,14 @@ if df is not None:
                 
                 # Charts
                 st.subheader("Price Forecast & SOC Profile")
-                st.line_chart(plot_df[["Predicted Price (€/MWh)", "SOC (MWh)"]])
+                fig_tomorrow = plot_price_and_soc_plotly(
+                    plot_df,
+                    price_col="Predicted Price (€/MWh)",
+                    p10_col="predicted_p10" if "predicted_p10" in plot_df.columns else None,
+                    p90_col="predicted_p90" if "predicted_p90" in plot_df.columns else None,
+                    soc_col="SOC (MWh)"
+                )
+                st.plotly_chart(fig_tomorrow, use_container_width=True)
                 
                 if use_multi_market:
                     st.subheader("BESS Multi-Market Scheduling Schedule")
@@ -540,12 +702,19 @@ if df is not None:
                 day_idm = prices + idm_spread_val * np.sin(np.arange(T) * 2 * np.pi / 24)
                 day_fcr = np.full(T, fcr_price_val)
                 
+                prices_std = np.std(prices) if len(prices) > 1 else 10.0
+                prices_p10 = prices - 1.28 * prices_std
+                prices_p90 = prices + 1.28 * prices_std
+                
                 res = bess_arbitrage.optimize_day(
                     prices, bat, 
                     use_degradation=use_degradation,
                     use_multi_market=use_multi_market,
                     idm_prices=day_idm,
-                    fcr_prices=day_fcr
+                    fcr_prices=day_fcr,
+                    prices_p10=prices_p10,
+                    prices_p90=prices_p90,
+                    gamma=gamma
                 )
                 
                 if res["status"] in ("optimal", "optimal_inaccurate"):
@@ -590,6 +759,8 @@ if df is not None:
                     # Create plotting data
                     plot_df_data = {
                         "Price (€/MWh)": prices,
+                        "prices_p10": prices_p10,
+                        "prices_p90": prices_p90,
                         "SOC (MWh)": res["soc"][1:],  # exclude initial soc at index 0
                         "Total Charge Power (MW)": res["charge"],
                         "Total Discharge Power (MW)": res["discharge"]
@@ -608,10 +779,15 @@ if df is not None:
                     plot_df.loc[plot_df["Total Discharge Power (MW)"] > 1e-3, "Action"] = "Discharge"
                     
                     # Custom Streamlit Charts
-                    st.subheader("Price vs Battery Action")
-                    
-                    # Draw Price and SOC
-                    st.line_chart(plot_df[["Price (€/MWh)", "SOC (MWh)"]])
+                    st.subheader("Price Forecast & SOC Profile")
+                    fig_day = plot_price_and_soc_plotly(
+                        plot_df,
+                        price_col="Price (€/MWh)",
+                        p10_col="prices_p10" if "prices_p10" in plot_df.columns else None,
+                        p90_col="prices_p90" if "prices_p90" in plot_df.columns else None,
+                        soc_col="SOC (MWh)"
+                    )
+                    st.plotly_chart(fig_day, use_container_width=True)
                     
                     # Draw Charge/Discharge Schedule
                     if use_multi_market:
@@ -675,55 +851,18 @@ if df is not None:
                 run_eval = st.button("📊 Evaluate Forecast & Arbitrage Models")
                 
                 if run_eval or "eval_results" not in st.session_state:
-                    with st.spinner("Training LightGBM model and running multi-day backtest..."):
+                    with st.spinner("Training Machine Learning models and running multi-day backtest..."):
                         real = df["price_eur_mwh"].dropna()
-                        
-                        # Perfect foresight
-                        pf = forecast.backtest_with_forecast(
-                            real, real, bat, 
-                            use_degradation=use_degradation,
-                            use_multi_market=use_multi_market,
-                            fcr_price=fcr_price_val,
-                            idm_spread=idm_spread_val
-                        )
-                        
-                        # Baseline
                         base_pred = forecast.baseline_forecast(df)
-                        bl = forecast.backtest_with_forecast(
-                            real, base_pred, bat, 
-                            use_degradation=use_degradation,
-                            use_multi_market=use_multi_market,
-                            fcr_price=fcr_price_val,
-                            idm_spread=idm_spread_val
-                        )
-                        
-                        # LightGBM Walk-forward
-                        feat = forecast.make_features(df)
-                        pred_lgb = forecast.lgbm_walkforward(feat, str(eval_date))
                         
                         # Compare on the test window only (fair comparison)
                         mask = real.index >= eval_dt
-                        pf_test = forecast.backtest_with_forecast(
-                            real[mask], real[mask], bat, 
-                            use_degradation=use_degradation,
-                            use_multi_market=use_multi_market,
-                            fcr_price=fcr_price_val,
-                            idm_spread=idm_spread_val
-                        )
-                        bl_test = forecast.backtest_with_forecast(
-                            real[mask], base_pred[mask], bat, 
-                            use_degradation=use_degradation,
-                            use_multi_market=use_multi_market,
-                            fcr_price=fcr_price_val,
-                            idm_spread=idm_spread_val
-                        )
-                        ml_test = forecast.backtest_with_forecast(
-                            real[mask], pred_lgb, bat, 
-                            use_degradation=use_degradation,
-                            use_multi_market=use_multi_market,
-                            fcr_price=fcr_price_val,
-                            idm_spread=idm_spread_val
-                        )
+                        
+                        # ML walkforward ensemble and quantiles
+                        feat = forecast.make_features(df)
+                        pred_ml = forecast.ensemble_walkforward(feat, str(eval_date))
+                        pred_ml_p10 = forecast.ensemble_walkforward(feat, str(eval_date), quantile=0.1)
+                        pred_ml_p90 = forecast.ensemble_walkforward(feat, str(eval_date), quantile=0.9)
                         
                         # Create cumulative profit curves
                         # We will build day-by-day profits
@@ -735,36 +874,65 @@ if df is not None:
                         bl_cum = 0
                         ml_cum = 0
                         
+                        pf_profits = []
+                        bl_profits = []
+                        ml_profits = []
+                        
                         cum_data = []
                         for day in test_dates:
                             day_idx = test_idx[test_idx.date == day]
+                            if len(day_idx) < 24:
+                                continue
+                                
                             rp = real.loc[day_idx].to_numpy()
                             bp = base_pred.loc[day_idx].to_numpy()
-                            mp = pred_lgb.loc[day_idx].to_numpy() if day_idx[0] in pred_lgb.index else np.array([])
+                            mp = pred_ml.loc[day_idx].to_numpy() if day_idx[0] in pred_ml.index else np.array([])
                             
-                            # Perfect
-                            T_day = len(rp)
-                            rp_idm = rp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24)
-                            rp_fcr = np.full(T_day, fcr_price_val)
-                            bp_idm = bp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24) if len(bp) == 24 else None
+                            # Perfect Foresight scenarios
+                            rp_std = np.std(rp) if len(rp) > 1 else 10.0
+                            rp_p10 = rp - 1.28 * rp_std
+                            rp_p90 = rp + 1.28 * rp_std
+                            rp_idm = rp + idm_spread_val * np.sin(np.arange(24) * 2 * np.pi / 24)
+                            rp_fcr = np.full(24, fcr_price_val)
                             
+                            # Baseline scenarios
+                            bp_std = np.std(bp) if (len(bp) > 1 and not np.isnan(bp).any()) else 10.0
+                            bp_p10 = bp - 1.28 * bp_std
+                            bp_p90 = bp + 1.28 * bp_std
+                            bp_idm = bp + idm_spread_val * np.sin(np.arange(24) * 2 * np.pi / 24) if not np.isnan(bp).any() else None
+                            
+                            # ML scenarios
+                            mp_p10 = pred_ml_p10.loc[day_idx].to_numpy() if (pred_ml_p10 is not None and day_idx[0] in pred_ml_p10.index) else (mp - 15.0)
+                            mp_p90 = pred_ml_p90.loc[day_idx].to_numpy() if (pred_ml_p90 is not None and day_idx[0] in pred_ml_p90.index) else (mp + 15.0)
+                            mp_idm = mp + idm_spread_val * np.sin(np.arange(24) * 2 * np.pi / 24) if len(mp) == 24 else None
+                            
+                            # 1. Perfect Foresight (Oracle)
                             p_res = bess_arbitrage.optimize_day(
                                 rp, bat, 
                                 use_degradation=use_degradation,
                                 use_multi_market=use_multi_market,
                                 idm_prices=rp_idm,
-                                fcr_prices=rp_fcr
+                                fcr_prices=rp_fcr,
+                                prices_p10=rp_p10,
+                                prices_p90=rp_p90,
+                                gamma=gamma
                             ) if len(rp) == 24 else {"status": "failed"}
                             if p_res["status"] in ("optimal", "optimal_inaccurate"):
                                 pf_cum += p_res["profit"]
+                                pf_profits.append(p_res["profit"])
+                            else:
+                                pf_profits.append(0.0)
                                 
-                            # Baseline
+                            # 2. Baseline
                             b_res = bess_arbitrage.optimize_day(
                                 bp, bat, 
                                 use_degradation=use_degradation,
                                 use_multi_market=use_multi_market,
                                 idm_prices=bp_idm,
-                                fcr_prices=rp_fcr
+                                fcr_prices=rp_fcr,
+                                prices_p10=bp_p10,
+                                prices_p90=bp_p90,
+                                gamma=gamma
                             ) if len(bp) == 24 and not np.isnan(bp).any() else {"status": "failed"}
                             if b_res["status"] in ("optimal", "optimal_inaccurate"):
                                 if use_multi_market:
@@ -787,17 +955,23 @@ if df is not None:
                                     deg_cost = soc_penalty_val + power_penalty_val
                                 else:
                                     deg_cost = 0.0
-                                bl_cum += (gross_val - cycle_wear - deg_cost)
+                                real_profit = gross_val - cycle_wear - deg_cost
+                                bl_cum += real_profit
+                                bl_profits.append(real_profit)
+                            else:
+                                bl_profits.append(0.0)
                                 
-                            # ML (LightGBM)
+                            # 3. ML (Ensemble)
                             if len(mp) == 24 and not np.isnan(mp).any():
-                                mp_idm = mp + idm_spread_val * np.sin(np.arange(T_day) * 2 * np.pi / 24)
                                 m_res = bess_arbitrage.optimize_day(
                                     mp, bat, 
                                     use_degradation=use_degradation,
                                     use_multi_market=use_multi_market,
                                     idm_prices=mp_idm,
-                                    fcr_prices=rp_fcr
+                                    fcr_prices=rp_fcr,
+                                    prices_p10=mp_p10,
+                                    prices_p90=mp_p90,
+                                    gamma=gamma
                                 )
                                 if m_res["status"] in ("optimal", "optimal_inaccurate"):
                                     if use_multi_market:
@@ -820,16 +994,38 @@ if df is not None:
                                         deg_cost = soc_penalty_val + power_penalty_val
                                     else:
                                         deg_cost = 0.0
-                                    ml_cum += (gross_val - cycle_wear - deg_cost)
-                                    
+                                    real_profit = gross_val - cycle_wear - deg_cost
+                                    ml_cum += real_profit
+                                    ml_profits.append(real_profit)
+                                else:
+                                    ml_profits.append(0.0)
+                            else:
+                                ml_profits.append(0.0)
+                                
                             cum_data.append({
                                 "Date": day,
                                 "Perfect Foresight": pf_cum,
                                 "Baseline Forecast": bl_cum,
-                                "LightGBM Forecast": ml_cum
+                                "Ensemble ML Forecast": ml_cum
                             })
                             
                         cum_df = pd.DataFrame(cum_data).set_index("Date")
+                        
+                        pf_test = {
+                            "total": float(np.sum(pf_profits)),
+                            "daily_mean": float(np.mean(pf_profits)) if len(pf_profits) > 0 else 0.0,
+                            "n_days": len(pf_profits)
+                        }
+                        bl_test = {
+                            "total": float(np.sum(bl_profits)),
+                            "daily_mean": float(np.mean(bl_profits)) if len(bl_profits) > 0 else 0.0,
+                            "n_days": len(bl_profits)
+                        }
+                        ml_test = {
+                            "total": float(np.sum(ml_profits)),
+                            "daily_mean": float(np.mean(ml_profits)) if len(ml_profits) > 0 else 0.0,
+                            "n_days": len(ml_profits)
+                        }
                         
                         # Store in session state
                         st.session_state.eval_results = {
@@ -852,7 +1048,7 @@ if df is not None:
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Perfect Foresight Profit", f"€ {pf_test['total']:,.2f}", help="Maximum theoretical returns with 100% accurate forecast.")
                 col2.metric("Baseline Profit (Lag-168)", f"€ {bl_test['total']:,.2f}", f"Capture: {100 * bl_test['total'] / pf_test['total']:.1f}%")
-                col3.metric("LightGBM ML Profit", f"€ {ml_test['total']:,.2f}", f"Capture: {100 * ml_test['total'] / pf_test['total']:.1f}%")
+                col3.metric("Ensemble ML Profit", f"€ {ml_test['total']:,.2f}", f"Capture: {100 * ml_test['total'] / pf_test['total']:.1f}%")
                 
                 st.subheader("Cumulative Profits Over Time")
                 st.line_chart(cum_df)
@@ -860,7 +1056,7 @@ if df is not None:
                 # Show tabular report
                 st.subheader("Strategy Metrics Table")
                 metrics_table = pd.DataFrame({
-                    "Strategy": ["Perfect Foresight (Oracle)", "Baseline (Lag-168h)", "LightGBM ML Forecast"],
+                    "Strategy": ["Perfect Foresight (Oracle)", "Baseline (Lag-168h)", "Ensemble ML Forecast"],
                     "Total Profit (€)": [pf_test["total"], bl_test["total"], ml_test["total"]],
                     "Capture Rate (%)": ["100.0%", f"{100 * bl_test['total'] / pf_test['total']:.1f}%", f"{100 * ml_test['total'] / pf_test['total']:.1f}%"],
                     "Daily Average Profit (€)": [pf_test["daily_mean"], bl_test["daily_mean"], ml_test["daily_mean"]],

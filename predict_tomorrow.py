@@ -85,9 +85,10 @@ def get_synthetic_inference_data(today, tomorrow):
     }, index=idx)
     return df
 
-def run_prediction_and_schedule():
+def run_prediction_and_schedule(gamma=0.0):
     print("=" * 60)
     print("🔮 TOMORROW'S LIVE PRICE FORECAST & BESS SCHEDULING")
+    print(f"  [Risk Setting] Gamma: {gamma:.2f}")
     print("=" * 60)
     
     today = datetime.date.today()
@@ -172,20 +173,63 @@ def run_prediction_and_schedule():
         pred_prices = test_data["price_lag24"].to_numpy()
         model_name = "Lag-24h (ML Fallback)"
         
+    # Quantile prediction using LGBM spreads anchored on the ensemble
+    pred_p10 = None
+    pred_p90 = None
+    if forecast.HAS_LGB:
+        print("  Training LightGBM Quantile models (P10 & P90)...")
+        import lightgbm as lgb
+        model_lgb_p10 = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.1,
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1
+        )
+        model_lgb_p10.fit(train_data[feat_cols], train_data["target"])
+        p10_lgb = model_lgb_p10.predict(test_data[feat_cols])
+        
+        model_lgb_p90 = lgb.LGBMRegressor(
+            objective="quantile", alpha=0.9,
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1
+        )
+        model_lgb_p90.fit(train_data[feat_cols], train_data["target"])
+        p90_lgb = model_lgb_p90.predict(test_data[feat_cols])
+        
+        if forecast.HAS_XGB:
+            delta_p10 = p10_lgb - pred_lgb
+            delta_p90 = p90_lgb - pred_lgb
+            pred_p10 = pred_prices + delta_p10
+            pred_p90 = pred_prices + delta_p90
+        else:
+            pred_p10 = p10_lgb
+            pred_p90 = p90_lgb
+    else:
+        std_dev = train_data["target"].std() if len(train_data) > 0 else 15.0
+        pred_p10 = pred_prices - 1.28 * std_dev
+        pred_p90 = pred_prices + 1.28 * std_dev
+        
     print(f"\n🔮 Predicted Hourly Prices for tomorrow ({tomorrow_date}) using {model_name}:")
-    pred_series = pd.Series(pred_prices, index=test_data.index)
-    for dt, val in pred_series.items():
-        print(f"  {dt.strftime('%H:%M')}: €{val:,.2f}/MWh")
+    print(f"  {'Hour':<6} {'P10 Low':<12} {'Expected':<12} {'P90 High':<12}")
+    print("-" * 48)
+    for i, (dt, val) in enumerate(test_data.index.to_series().items()):
+        print(f"  {dt.strftime('%H:%M')}: €{pred_p10[i]:>9.2f} / €{pred_prices[i]:>9.2f} / €{pred_p90[i]:>9.2f}")
         
     # Run Battery Optimization on predicted prices
     print("\n🔋 Running BESS Arbitrage optimization on predicted prices...")
     bat = bess_arbitrage.Battery(capacity_mwh=2.0, power_mw=1.0, rte=0.88, cycle_cost_eur_mwh=4.0)
-    res = bess_arbitrage.optimize_day(pred_prices, bat)
+    res = bess_arbitrage.optimize_day(
+        pred_prices, bat,
+        prices_p10=pred_p10,
+        prices_p90=pred_p90,
+        gamma=gamma
+    )
     
     if res["status"] in ("optimal", "optimal_inaccurate"):
         print("\n📈 TOMORROW'S OPTIMAL BATTERY SCHEDULE PLAN:")
         schedule = pd.DataFrame({
             "Pred_Price": pred_prices,
+            "Pred_P10": pred_p10,
+            "Pred_P90": pred_p90,
             "Charge_MW": res["charge"],
             "Discharge_MW": res["discharge"],
             "SOC_MWh": res["soc"][1:]
@@ -195,7 +239,7 @@ def run_prediction_and_schedule():
         schedule.loc[schedule["Charge_MW"] > 1e-3, "Action"] = "CHARGE 🔌"
         schedule.loc[schedule["Discharge_MW"] > 1e-3, "Action"] = "DISCHARGE ⚡"
         
-        print(schedule[["Pred_Price", "Charge_MW", "Discharge_MW", "SOC_MWh", "Action"]].round(3).to_string())
+        print(schedule[["Pred_Price", "Pred_P10", "Pred_P90", "Charge_MW", "Discharge_MW", "SOC_MWh", "Action"]].round(3).to_string())
         
         expected_profit = res["profit"]
         print("\n💰 FINANCIAL EXPECTATION:")
@@ -210,4 +254,9 @@ def run_prediction_and_schedule():
         print(f"\n❌ Optimization failed! Status: {res['status']}")
 
 if __name__ == "__main__":
-    run_prediction_and_schedule()
+    import argparse
+    parser = argparse.ArgumentParser(description="Predict tomorrow's prices and BESS arbitrage schedule.")
+    parser.add_argument("--gamma", type=float, default=0.0, help="Risk aversion coefficient (0.0 to 0.95)")
+    args = parser.parse_args()
+    
+    run_prediction_and_schedule(gamma=args.gamma)

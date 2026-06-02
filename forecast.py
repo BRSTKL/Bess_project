@@ -68,7 +68,7 @@ def baseline_forecast(df):
     return df["price_eur_mwh"].shift(168).rename("pred_baseline")
 
 
-def lgbm_walkforward(feat, train_end):
+def lgbm_walkforward(feat, train_end, quantile=None):
     if not HAS_LGB:
         raise RuntimeError("lightgbm not installed: pip install lightgbm")
     data = feat.dropna()
@@ -77,13 +77,22 @@ def lgbm_walkforward(feat, train_end):
     if len(test) == 0:
         raise ValueError("Test set empty - train_end must be before data end.")
     feat_cols = [c for c in data.columns if c != "target"]
-    model = lgb.LGBMRegressor(
-        n_estimators=400, learning_rate=0.03, num_leaves=31,
-        subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
-    )
+    
+    if quantile is not None:
+        model = lgb.LGBMRegressor(
+            objective="quantile", alpha=quantile,
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
+        )
+    else:
+        model = lgb.LGBMRegressor(
+            n_estimators=400, learning_rate=0.03, num_leaves=31,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, verbose=-1,
+        )
     model.fit(train[feat_cols], train["target"])
     pred = model.predict(test[feat_cols])
-    return pd.Series(pred, index=test.index, name="pred_lgbm")
+    name = f"pred_lgbm_q{int(quantile*100)}" if quantile is not None else "pred_lgbm"
+    return pd.Series(pred, index=test.index, name=name)
 
 
 def xgboost_walkforward(feat, train_end):
@@ -104,17 +113,28 @@ def xgboost_walkforward(feat, train_end):
     return pd.Series(pred, index=test.index, name="pred_xgb")
 
 
-def ensemble_walkforward(feat, train_end):
-    if HAS_LGB and HAS_XGB:
-        pred_lgb = lgbm_walkforward(feat, train_end)
-        pred_xgb = xgboost_walkforward(feat, train_end)
-        return pd.Series(0.5 * pred_lgb + 0.5 * pred_xgb, index=pred_lgb.index, name="pred_ensemble")
-    elif HAS_LGB:
-        return lgbm_walkforward(feat, train_end).rename("pred_ensemble")
-    elif HAS_XGB:
-        return xgboost_walkforward(feat, train_end).rename("pred_ensemble")
+def ensemble_walkforward(feat, train_end, quantile=None):
+    if quantile is None:
+        if HAS_LGB and HAS_XGB:
+            pred_lgb = lgbm_walkforward(feat, train_end)
+            pred_xgb = xgboost_walkforward(feat, train_end)
+            return pd.Series(0.5 * pred_lgb + 0.5 * pred_xgb, index=pred_lgb.index, name="pred_ensemble")
+        elif HAS_LGB:
+            return lgbm_walkforward(feat, train_end).rename("pred_ensemble")
+        elif HAS_XGB:
+            return xgboost_walkforward(feat, train_end).rename("pred_ensemble")
+        else:
+            raise RuntimeError("Neither lightgbm nor xgboost is installed.")
     else:
-        raise RuntimeError("Neither lightgbm nor xgboost is installed.")
+        # Quantile prediction using LGBM as anchor spread applied on ensemble median
+        pred_base = ensemble_walkforward(feat, train_end, quantile=None)
+        pred_lgb_mean = lgbm_walkforward(feat, train_end, quantile=None)
+        pred_lgb_q = lgbm_walkforward(feat, train_end, quantile=quantile)
+        
+        delta = pred_lgb_q - pred_lgb_mean
+        pred_q = pred_base + delta
+        name = f"pred_ensemble_q{int(quantile*100)}"
+        return pd.Series(pred_q, index=pred_base.index, name=name)
 
 
 def backtest_with_forecast(real_price, pred_price, bat, dt_h=1.0, use_degradation=False, use_multi_market=False, fcr_price=18.0, idm_spread=10.0):
